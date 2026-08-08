@@ -311,7 +311,8 @@ function openCodeChildEventKey(event: OpenCodeSubscribedEvent): string {
     openCodeString(properties?.messageID) ??
     openCodeString(properties?.requestID) ??
     status;
-  return `${event.type}:${stableId ?? "event"}${partStateKey}`;
+  const infoSnapshot = info ? `:${JSON.stringify(info)}` : "";
+  return `${event.type}:${stableId ?? "event"}${partStateKey}${infoSnapshot}`;
 }
 
 function openCodeChildLinkage(child: OpenCodeChildContext) {
@@ -1242,6 +1243,7 @@ export function makeOpenCodeAdapter(
       context: OpenCodeSessionContext,
       child: OpenCodeChildContext,
       turnId: TurnId | undefined,
+      hydrateToolProgress: boolean,
     ) {
       const messages = yield* runOpenCodeSdk("session.messages", () =>
         context.client.session.messages({
@@ -1266,7 +1268,7 @@ export function makeOpenCodeAdapter(
           }
         }
       }
-      if (latestToolPart) {
+      if (hydrateToolProgress && latestToolPart) {
         yield* emitChildToolProgress(context, child, latestToolPart, turnId);
       }
 
@@ -1357,7 +1359,7 @@ export function makeOpenCodeAdapter(
       }
 
       if (isNewLink || isNewActivation) {
-        yield* hydrateChild(context, child, turnId);
+        yield* hydrateChild(context, child, turnId, !isNewActivation);
       }
     });
 
