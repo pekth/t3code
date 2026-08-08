@@ -7,7 +7,9 @@ import {
   type ProviderSession,
   RuntimeItemId,
   RuntimeRequestId,
+  RuntimeTaskId,
   ThreadId,
+  type RuntimeTaskStatus,
   type ToolLifecycleItemType,
   TurnId,
   type UserInputQuestion,
@@ -204,6 +206,123 @@ function openCodeEventSessionTitle(event: OpenCodeSubscribedEvent): string | und
   return trimText(event.properties.info.title);
 }
 
+type OpenCodeChildTerminalStatus = "completed" | "failed" | "stopped";
+
+interface OpenCodeTaskLink {
+  readonly childId: string;
+  readonly parentSessionId: string;
+  readonly description: string;
+  readonly role: string;
+  readonly model?: string;
+  readonly background: boolean;
+}
+
+interface OpenCodeChildContext {
+  readonly id: string;
+  readonly parentSessionId: string;
+  description: string | undefined;
+  role: string | undefined;
+  model: string | undefined;
+  background: boolean;
+  linked: boolean;
+  lastTaskPartId: string | undefined;
+  lastStatus: RuntimeTaskStatus | undefined;
+  terminalStatus: OpenCodeChildTerminalStatus | undefined;
+  lastToolFingerprint: string | undefined;
+  readonly bufferedEvents: Array<OpenCodeSubscribedEvent>;
+  readonly bufferedEventKeys: Set<string>;
+  readonly seenEventKeys: Set<string>;
+}
+
+const OPENCODE_CHILD_EVENT_BUFFER_LIMIT = 64;
+const OPENCODE_CHILD_EVENT_KEY_LIMIT = 256;
+
+function openCodeRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function openCodeString(value: unknown): string | undefined {
+  return typeof value === "string" ? trimText(value) : undefined;
+}
+
+function openCodeModelName(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    return trimText(value);
+  }
+  const model = openCodeRecord(value);
+  const providerID = openCodeString(model?.providerID);
+  const modelID = openCodeString(model?.modelID);
+  return providerID && modelID ? `${providerID}/${modelID}` : undefined;
+}
+
+function openCodeTaskLinkFromPart(part: Part): OpenCodeTaskLink | undefined {
+  if (part.type !== "tool" || part.tool !== "task") {
+    return undefined;
+  }
+
+  const input = openCodeRecord(part.state.input);
+  const state = openCodeRecord(part.state);
+  const metadata = openCodeRecord(state?.metadata);
+  const childId = openCodeString(metadata?.sessionId);
+  const parentSessionId = openCodeString(metadata?.parentSessionId);
+  const description = openCodeString(input?.description);
+  const role = openCodeString(input?.subagent_type);
+  if (!childId || !parentSessionId || !description || !role) {
+    return undefined;
+  }
+
+  const model = openCodeModelName(metadata?.model);
+  return {
+    childId,
+    parentSessionId,
+    description,
+    role,
+    ...(model ? { model } : {}),
+    background: metadata?.background === true || input?.background === true,
+  };
+}
+
+function openCodeProviderStatusType(value: unknown): "busy" | "retry" | "idle" | undefined {
+  const type = openCodeString(openCodeRecord(value)?.type);
+  return type === "busy" || type === "retry" || type === "idle" ? type : undefined;
+}
+
+function openCodeChildEventKey(event: OpenCodeSubscribedEvent): string {
+  const eventId = "id" in event ? openCodeString(event.id) : undefined;
+  if (eventId) {
+    return `${event.type}:${eventId}`;
+  }
+
+  const properties = openCodeRecord("properties" in event ? event.properties : undefined);
+  const part = openCodeRecord(properties?.part);
+  const info = openCodeRecord(properties?.info);
+  const status = openCodeString(openCodeRecord(properties?.status)?.type);
+  const stableId =
+    openCodeString(part?.id) ??
+    openCodeString(info?.id) ??
+    openCodeString(properties?.messageID) ??
+    openCodeString(properties?.requestID) ??
+    status;
+  return `${event.type}:${stableId ?? "event"}`;
+}
+
+function openCodeChildLinkage(child: OpenCodeChildContext) {
+  if (!child.linked || !child.description || !child.role) {
+    return undefined;
+  }
+  return {
+    taskId: RuntimeTaskId.make(child.id),
+    taskType: "local_agent" as const,
+    description: child.description,
+    title: child.description,
+    role: child.role,
+    ...(child.model ? { model: child.model } : {}),
+    timelineBypass: true as const,
+  };
+}
+
 interface OpenCodeSessionContext {
   session: ProviderSession;
   readonly client: OpencodeClient;
@@ -216,6 +335,11 @@ interface OpenCodeSessionContext {
   readonly partById: Map<string, Part>;
   readonly emittedTextByPartId: Map<string, string>;
   readonly completedAssistantPartIds: Set<string>;
+  readonly children: Map<string, OpenCodeChildContext>;
+  readonly abortingChildIds: Set<string>;
+  childStatusMap: Readonly<Record<string, unknown>> | undefined;
+  childStatusMapLoaded: boolean;
+  emitChildStopped: (childId: string) => Effect.Effect<void>;
   readonly turns: Array<OpenCodeTurnSnapshot>;
   activeTurnId: TurnId | undefined;
   activeAgent: string | undefined;
@@ -538,6 +662,67 @@ function updateProviderSession(
   });
 }
 
+const abortTrackedOpenCodeChildren = Effect.fn("abortTrackedOpenCodeChildren")(function* (
+  context: OpenCodeSessionContext,
+) {
+  const childIds = [...context.children.keys()];
+  if (childIds.length === 0) {
+    return [] as string[];
+  }
+  for (const childId of childIds) {
+    context.abortingChildIds.add(childId);
+  }
+
+  const attempts = yield* Effect.forEach(
+    childIds,
+    (childId) =>
+      runOpenCodeSdk("session.abort", () => context.client.session.abort({ sessionID: childId })).pipe(
+        Effect.map(() => ({ childId, aborted: true })),
+        Effect.catch(() => Effect.succeed({ childId, aborted: false })),
+      ),
+    { concurrency: "unbounded" },
+  );
+  const abortedIds = attempts.filter((attempt) => attempt.aborted).map((attempt) => attempt.childId);
+  if (abortedIds.length === 0) {
+    clearAbortingOpenCodeChildren(context, childIds);
+    return [] as string[];
+  }
+
+  const statusMap = yield* runOpenCodeSdk("session.status", () =>
+    context.client.session.status({ directory: context.directory }),
+  ).pipe(
+    Effect.map((response) => openCodeRecord(response.data)),
+    Effect.catch(() => Effect.succeed(undefined)),
+  );
+  if (!statusMap) {
+    clearAbortingOpenCodeChildren(context, childIds);
+    return [] as string[];
+  }
+
+  const stoppedChildIds = abortedIds.filter((childId) => {
+    const child = context.children.get(childId);
+    if (!child || child.terminalStatus) {
+      return false;
+    }
+    const status = statusMap[childId];
+    return status === undefined || openCodeProviderStatusType(status) === "idle";
+  });
+  clearAbortingOpenCodeChildren(
+    context,
+    childIds.filter((childId) => !stoppedChildIds.includes(childId)),
+  );
+  return stoppedChildIds;
+});
+
+const clearAbortingOpenCodeChildren = (
+  context: OpenCodeSessionContext,
+  childIds: ReadonlyArray<string>,
+): void => {
+  for (const childId of childIds) {
+    context.abortingChildIds.delete(childId);
+  }
+};
+
 const stopOpenCodeContext = Effect.fn("stopOpenCodeContext")(function* (
   context: OpenCodeSessionContext,
 ) {
@@ -545,6 +730,17 @@ const stopOpenCodeContext = Effect.fn("stopOpenCodeContext")(function* (
   if (yield* Ref.getAndSet(context.stopped, true)) {
     return false;
   }
+
+  // Capture and abort every tracked direct child before closing the scope.
+  // A stopped row is emitted only when the child abort succeeds and the
+  // provider no longer reports it busy/retrying.
+  const stoppedChildIds = yield* abortTrackedOpenCodeChildren(context);
+  yield* Effect.forEach(
+    stoppedChildIds,
+    (childId) => context.emitChildStopped(childId).pipe(Effect.ignore),
+    { concurrency: "unbounded", discard: true },
+  );
+  clearAbortingOpenCodeChildren(context, stoppedChildIds);
 
   // Best-effort remote abort. The scope close below tears down the local
   // handles (event-pump fiber, server-exit fiber, event-subscribe fetch),
@@ -709,6 +905,13 @@ export function makeOpenCodeAdapter(
       // Inline the teardown that `stopOpenCodeContext` would do; we can't
       // delegate to it because our `getAndSet` above already flipped the
       // one-shot guard, so the call would no-op.
+      const stoppedChildIds = yield* abortTrackedOpenCodeChildren(context);
+      yield* Effect.forEach(
+        stoppedChildIds,
+        (childId) => context.emitChildStopped(childId).pipe(Effect.ignore),
+        { concurrency: "unbounded", discard: true },
+      );
+      clearAbortingOpenCodeChildren(context, stoppedChildIds);
       yield* runOpenCodeSdk("session.abort", () =>
         context.client.session.abort({ sessionID: context.openCodeSessionId }),
       ).pipe(Effect.ignore({ log: true }));
@@ -782,28 +985,396 @@ export function makeOpenCodeAdapter(
       }
     });
 
-    const handleSubscribedEvent = Effect.fn("handleSubscribedEvent")(function* (
+    const rememberChildEventKey = (
+      child: OpenCodeChildContext,
+      event: OpenCodeSubscribedEvent,
+    ): boolean => {
+      const key = openCodeChildEventKey(event);
+      if (child.seenEventKeys.has(key)) {
+        return false;
+      }
+      if (child.seenEventKeys.size >= OPENCODE_CHILD_EVENT_KEY_LIMIT) {
+        const oldest = child.seenEventKeys.values().next().value;
+        if (typeof oldest === "string") {
+          child.seenEventKeys.delete(oldest);
+        }
+      }
+      child.seenEventKeys.add(key);
+      return true;
+    };
+
+    const bufferChildEvent = (child: OpenCodeChildContext, event: OpenCodeSubscribedEvent): void => {
+      const key = openCodeChildEventKey(event);
+      if (child.bufferedEventKeys.has(key)) {
+        return;
+      }
+      if (child.bufferedEvents.length >= OPENCODE_CHILD_EVENT_BUFFER_LIMIT) {
+        return;
+      }
+      child.bufferedEvents.push(event);
+      child.bufferedEventKeys.add(key);
+    };
+
+    const emitChildStatus = Effect.fn("emitChildStatus")(function* (
+      context: OpenCodeSessionContext,
+      child: OpenCodeChildContext,
+      status: RuntimeTaskStatus,
+      turnId: TurnId | undefined,
+      raw?: unknown,
+    ) {
+      const linkage = openCodeChildLinkage(child);
+      if (
+        !linkage ||
+        context.abortingChildIds.has(child.id) ||
+        child.terminalStatus ||
+        child.lastStatus === status
+      ) {
+        return;
+      }
+      child.lastStatus = status;
+      yield* emit({
+        ...(yield* buildEventBase({
+          threadId: context.session.threadId,
+          turnId,
+          raw,
+        })),
+        type: "task.updated",
+        payload: {
+          ...linkage,
+          status,
+        },
+      });
+    });
+
+    const emitChildStarted = Effect.fn("emitChildStarted")(function* (
+      context: OpenCodeSessionContext,
+      child: OpenCodeChildContext,
+      turnId: TurnId | undefined,
+      raw?: unknown,
+    ) {
+      const linkage = openCodeChildLinkage(child);
+      if (!linkage) {
+        return;
+      }
+      child.lastStatus = "running";
+      yield* emit({
+        ...(yield* buildEventBase({
+          threadId: context.session.threadId,
+          turnId,
+          raw,
+        })),
+        type: "task.started",
+        payload: linkage,
+      });
+    });
+
+    const emitChildToolProgress = Effect.fn("emitChildToolProgress")(function* (
+      context: OpenCodeSessionContext,
+      child: OpenCodeChildContext,
+      part: Extract<Part, { type: "tool" }>,
+      turnId: TurnId | undefined,
+      raw?: unknown,
+    ) {
+      const linkage = openCodeChildLinkage(child);
+      if (!linkage || context.abortingChildIds.has(child.id)) {
+        return;
+      }
+      const fingerprint = `${part.id}:${part.tool}:${part.state.status}:${
+        part.state.status === "running"
+          ? part.state.time.start
+          : part.state.status === "pending"
+            ? part.state.raw
+            : part.state.time.end
+      }`;
+      if (child.lastToolFingerprint === fingerprint) {
+        return;
+      }
+      child.lastToolFingerprint = fingerprint;
+      yield* emit({
+        ...(yield* buildEventBase({
+          threadId: context.session.threadId,
+          turnId,
+          itemId: part.callID,
+          raw,
+        })),
+        type: "tool.progress",
+        payload: {
+          taskId: linkage.taskId,
+          toolName: part.tool,
+          toolUseId: part.callID,
+          ...(part.state.status === "running" && part.state.title
+            ? { summary: part.state.title }
+            : {}),
+        },
+      });
+    });
+
+    const emitChildCompleted = Effect.fn("emitChildCompleted")(function* (
+      context: OpenCodeSessionContext,
+      child: OpenCodeChildContext,
+      status: OpenCodeChildTerminalStatus,
+      turnId: TurnId | undefined,
+      raw?: unknown,
+      summary?: string,
+    ) {
+      const linkage = openCodeChildLinkage(child);
+      if (!linkage || context.abortingChildIds.has(child.id) || child.terminalStatus) {
+        return;
+      }
+      child.terminalStatus = status;
+      yield* emit({
+        ...(yield* buildEventBase({
+          threadId: context.session.threadId,
+          turnId,
+          raw,
+        })),
+        type: "task.completed",
+        payload: {
+          ...linkage,
+          status,
+          ...(summary ? { summary } : {}),
+        },
+      });
+    });
+
+    const handleChildSubscribedEvent = Effect.fn("handleChildSubscribedEvent")(function* (
+      context: OpenCodeSessionContext,
+      child: OpenCodeChildContext,
+      event: OpenCodeSubscribedEvent,
+    ) {
+      if (
+        !child.linked ||
+        context.abortingChildIds.has(child.id) ||
+        !rememberChildEventKey(child, event)
+      ) {
+        return;
+      }
+      const turnId = context.activeTurnId;
+      switch (event.type) {
+        case "message.updated": {
+          if (event.properties.info.role === "assistant" && event.properties.info.error) {
+            yield* emitChildCompleted(
+              context,
+              child,
+              "failed",
+              turnId,
+              event,
+              sessionErrorMessage(event.properties.info.error),
+            );
+          }
+          break;
+        }
+        case "message.part.updated": {
+          if (event.properties.part.type === "tool") {
+            yield* emitChildToolProgress(context, child, event.properties.part, turnId, event);
+          }
+          break;
+        }
+        case "permission.asked":
+        case "question.asked":
+          yield* emitChildStatus(context, child, "waiting", turnId, event);
+          break;
+        case "session.status": {
+          const status = openCodeProviderStatusType(event.properties.status);
+          if (status === "busy") {
+            yield* emitChildStatus(context, child, "running", turnId, event);
+          } else if (status === "retry") {
+            yield* emitChildStatus(context, child, "waiting", turnId, event);
+          } else if (status === "idle") {
+            yield* emitChildStatus(context, child, "idle", turnId, event);
+          }
+          break;
+        }
+        case "session.idle":
+          yield* emitChildStatus(context, child, "idle", turnId, event);
+          break;
+        case "session.error":
+          yield* emitChildCompleted(
+            context,
+            child,
+            "failed",
+            turnId,
+            event,
+            sessionErrorMessage(event.properties.error),
+          );
+          break;
+        default:
+          break;
+      }
+    });
+
+    const loadChildStatusMap = Effect.fn("loadOpenCodeChildStatusMap")(function* (
+      context: OpenCodeSessionContext,
+      childId: string,
+    ) {
+      if (context.childStatusMapLoaded) {
+        return context.childStatusMap;
+      }
+      context.childStatusMapLoaded = true;
+      const statusMap = yield* runOpenCodeSdk("session.status", () =>
+        context.client.session.status({ directory: context.directory }),
+      ).pipe(
+        Effect.map((response) => openCodeRecord(response.data)),
+        Effect.catch((cause: OpenCodeRuntimeError) =>
+          Effect.logWarning(
+            `OpenCode child hydration failed for session.status (${childId}): ${openCodeRuntimeErrorDetail(cause)}`,
+          ).pipe(Effect.as(undefined)),
+        ),
+      );
+      context.childStatusMap = statusMap;
+      return statusMap;
+    });
+
+    const hydrateChild = Effect.fn("hydrateOpenCodeChild")(function* (
+      context: OpenCodeSessionContext,
+      child: OpenCodeChildContext,
+      turnId: TurnId | undefined,
+    ) {
+      const messages = yield* runOpenCodeSdk("session.messages", () =>
+        context.client.session.messages({
+          sessionID: child.id,
+        }),
+      ).pipe(
+        Effect.map((response) => response.data ?? []),
+        Effect.catch((cause: OpenCodeRuntimeError) =>
+          Effect.logWarning(
+            `OpenCode child hydration failed for session.messages (${child.id}): ${openCodeRuntimeErrorDetail(cause)}`,
+          ).pipe(Effect.as(undefined)),
+        ),
+      );
+
+      let latestAssistantError: unknown;
+      let latestAssistantCompleted = false;
+      let latestToolPart: Extract<Part, { type: "tool" }> | undefined;
+      if (messages !== undefined) {
+        for (const entry of messages) {
+          if (entry.info.role === "assistant") {
+            latestAssistantError = entry.info.error;
+            latestAssistantCompleted = entry.info.time.completed !== undefined;
+          }
+          for (const part of entry.parts) {
+            if (part.type === "tool") {
+              latestToolPart = part;
+            }
+          }
+        }
+      }
+      if (latestToolPart) {
+        yield* emitChildToolProgress(context, child, latestToolPart, turnId);
+      }
+
+      const statusMap = yield* loadChildStatusMap(context, child.id);
+      let hydratedIdle = false;
+      if (statusMap) {
+        const providerStatus = statusMap[child.id];
+        const statusType =
+          providerStatus === undefined ? "idle" : openCodeProviderStatusType(providerStatus);
+        if (statusType === "busy") {
+          yield* emitChildStatus(context, child, "running", turnId);
+        } else if (statusType === "retry") {
+          yield* emitChildStatus(context, child, "waiting", turnId);
+        } else if (statusType === "idle") {
+          hydratedIdle = true;
+          yield* emitChildStatus(context, child, "idle", turnId);
+        }
+      }
+
+      const bufferedEvents = child.bufferedEvents.splice(0);
+      child.bufferedEventKeys.clear();
+      for (const event of bufferedEvents) {
+        yield* handleChildSubscribedEvent(context, child, event);
+      }
+      if (hydratedIdle && child.lastStatus === "idle" && !child.terminalStatus) {
+        if (latestAssistantError !== undefined) {
+          yield* emitChildCompleted(
+            context,
+            child,
+            "failed",
+            turnId,
+            undefined,
+            sessionErrorMessage(latestAssistantError),
+          );
+        } else if (latestAssistantCompleted && !child.background) {
+          yield* emitChildCompleted(context, child, "completed", turnId);
+        }
+      }
+    });
+
+    const linkOpenCodeChild = Effect.fn("linkOpenCodeChild")(function* (
+      context: OpenCodeSessionContext,
+      part: Extract<Part, { type: "tool" }>,
+      link: OpenCodeTaskLink,
+      turnId: TurnId | undefined,
+      raw: unknown,
+    ) {
+      if (link.parentSessionId !== context.openCodeSessionId) {
+        return;
+      }
+      let child = context.children.get(link.childId);
+      if (child && child.parentSessionId !== context.openCodeSessionId) {
+        return;
+      }
+      if (!child) {
+        child = {
+          id: link.childId,
+          parentSessionId: link.parentSessionId,
+          description: undefined,
+          role: undefined,
+          model: undefined,
+          background: false,
+          linked: false,
+          lastTaskPartId: undefined,
+          lastStatus: undefined,
+          terminalStatus: undefined,
+          lastToolFingerprint: undefined,
+          bufferedEvents: [],
+          bufferedEventKeys: new Set(),
+          seenEventKeys: new Set(),
+        };
+        context.children.set(link.childId, child);
+      }
+
+      const isNewLink = !child.linked;
+      const isNewActivation = child.linked && child.lastTaskPartId !== part.id;
+      if (isNewActivation) {
+        context.childStatusMap = undefined;
+        context.childStatusMapLoaded = false;
+      }
+      child.description = link.description;
+      child.role = link.role;
+      child.model = link.model;
+      child.background = link.background;
+      child.linked = true;
+      child.lastTaskPartId = part.id;
+
+      if (isNewActivation) {
+        child.terminalStatus = undefined;
+        child.lastStatus = undefined;
+        child.lastToolFingerprint = undefined;
+        child.seenEventKeys.clear();
+        yield* emitChildStatus(context, child, "running", turnId, raw);
+      } else if (isNewLink) {
+        yield* emitChildStarted(context, child, turnId, raw);
+      }
+
+      if (isNewLink || isNewActivation) {
+        yield* hydrateChild(context, child, turnId);
+      }
+
+      if (!context.abortingChildIds.has(child.id)) {
+        if (part.state.status === "error") {
+          yield* emitChildCompleted(context, child, "failed", turnId, raw, part.state.error);
+        } else if (part.state.status === "completed" && !child.background) {
+          yield* emitChildCompleted(context, child, "completed", turnId, raw, part.state.output);
+        }
+      }
+    });
+
+    const handleRootSubscribedEvent = Effect.fn("handleRootSubscribedEvent")(function* (
       context: OpenCodeSessionContext,
       event: OpenCodeSubscribedEvent,
     ) {
-      const payloadSessionId = openCodeEventSessionId(event);
-      if (payloadSessionId !== context.openCodeSessionId) {
-        return;
-      }
-
       const turnId = context.activeTurnId;
-      yield* writeNativeEventBestEffort(context.session.threadId, {
-        observedAt: yield* nowIso,
-        event: {
-          provider: PROVIDER,
-          threadId: context.session.threadId,
-          providerThreadId: context.openCodeSessionId,
-          type: event.type,
-          ...(turnId ? { turnId } : {}),
-          payload: event,
-        },
-      });
-
       switch (event.type) {
         case "session.updated": {
           const title = openCodeEventSessionTitle(event);
@@ -898,6 +1469,35 @@ export function makeOpenCodeAdapter(
           }
 
           if (part.type === "tool") {
+            const taskLink = part.tool === "task" ? openCodeTaskLinkFromPart(part) : undefined;
+            if (taskLink) {
+              yield* linkOpenCodeChild(context, part, taskLink, turnId, event);
+            } else if (part.tool === "task") {
+              const linkedChild = [...context.children.values()].find(
+                (child) => child.linked && child.lastTaskPartId === part.id,
+              );
+              if (linkedChild && !context.abortingChildIds.has(linkedChild.id)) {
+                if (part.state.status === "error") {
+                  yield* emitChildCompleted(
+                    context,
+                    linkedChild,
+                    "failed",
+                    turnId,
+                    event,
+                    part.state.error,
+                  );
+                } else if (part.state.status === "completed" && !linkedChild.background) {
+                  yield* emitChildCompleted(
+                    context,
+                    linkedChild,
+                    "completed",
+                    turnId,
+                    event,
+                    part.state.output,
+                  );
+                }
+              }
+            }
             const itemType = toToolLifecycleItemType(part.tool);
             const title =
               part.state.status === "running" ? (part.state.title ?? part.tool) : part.tool;
@@ -1118,6 +1718,78 @@ export function makeOpenCodeAdapter(
         default:
           break;
       }
+    });
+
+    const handleSubscribedEvent = Effect.fn("handleSubscribedEvent")(function* (
+      context: OpenCodeSessionContext,
+      event: OpenCodeSubscribedEvent,
+    ) {
+      if (yield* Ref.get(context.stopped)) {
+        return;
+      }
+      const payloadSessionId = openCodeEventSessionId(event);
+      if (!payloadSessionId) {
+        return;
+      }
+      const turnId = context.activeTurnId;
+      const writeNative = Effect.gen(function* () {
+        yield* writeNativeEventBestEffort(context.session.threadId, {
+          observedAt: yield* nowIso,
+          event: {
+            provider: PROVIDER,
+            threadId: context.session.threadId,
+            providerThreadId: payloadSessionId,
+            type: event.type,
+            ...(turnId ? { turnId } : {}),
+            payload: event,
+          },
+        });
+      });
+
+      if (payloadSessionId === context.openCodeSessionId) {
+        yield* writeNative;
+        yield* handleRootSubscribedEvent(context, event);
+        return;
+      }
+
+      let child = context.children.get(payloadSessionId);
+      if (!child && event.type === "session.created") {
+        const parentSessionId = openCodeString(event.properties.info.parentID);
+        if (parentSessionId !== context.openCodeSessionId) {
+          return;
+        }
+        child = {
+          id: payloadSessionId,
+          parentSessionId,
+          description: undefined,
+          role: undefined,
+          model: undefined,
+          background: false,
+          linked: false,
+          lastTaskPartId: undefined,
+          lastStatus: undefined,
+          terminalStatus: undefined,
+          lastToolFingerprint: undefined,
+          bufferedEvents: [],
+          bufferedEventKeys: new Set(),
+          seenEventKeys: new Set(),
+        };
+        context.children.set(payloadSessionId, child);
+        context.childStatusMap = undefined;
+        context.childStatusMapLoaded = false;
+        yield* writeNative;
+        return;
+      }
+      if (!child) {
+        return;
+      }
+
+      yield* writeNative;
+      if (!child.linked) {
+        bufferChildEvent(child, event);
+        return;
+      }
+      yield* handleChildSubscribedEvent(context, child, event);
     });
 
     const startEventPump = Effect.fn("startEventPump")(function* (context: OpenCodeSessionContext) {
@@ -1368,6 +2040,30 @@ export function makeOpenCodeAdapter(
           updatedAt: createdAt,
         };
 
+        const emitChildStopped = (
+          context: OpenCodeSessionContext,
+          childId: string,
+        ): Effect.Effect<void, never, never> =>
+          Effect.gen(function* () {
+            const child = context.children.get(childId);
+            const linkage = child ? openCodeChildLinkage(child) : undefined;
+            if (!child || !linkage || child.terminalStatus) {
+              return;
+            }
+            child.terminalStatus = "stopped";
+            yield* emit({
+              ...(yield* buildEventBase({
+                threadId: context.session.threadId,
+                turnId: context.activeTurnId,
+              })),
+              type: "task.completed",
+              payload: {
+                ...linkage,
+                status: "stopped",
+              },
+            });
+          }).pipe(Effect.catchCause(() => Effect.void));
+
         const context: OpenCodeSessionContext = {
           session,
           client: started.client,
@@ -1380,6 +2076,11 @@ export function makeOpenCodeAdapter(
           emittedTextByPartId: new Map(),
           messageRoleById: new Map(),
           completedAssistantPartIds: new Set(),
+          children: new Map(),
+          abortingChildIds: new Set(),
+          childStatusMap: undefined,
+          childStatusMapLoaded: false,
+          emitChildStopped: () => Effect.void,
           turns: [],
           activeTurnId: undefined,
           activeAgent: undefined,
@@ -1387,6 +2088,7 @@ export function makeOpenCodeAdapter(
           stopped: yield* Ref.make(false),
           sessionScope: started.sessionScope,
         };
+        context.emitChildStopped = (childId) => emitChildStopped(context, childId);
         sessions.set(input.threadId, context);
         yield* startEventPump(context);
 
@@ -1540,6 +2242,13 @@ export function makeOpenCodeAdapter(
     const interruptTurn: OpenCodeAdapterShape["interruptTurn"] = Effect.fn("interruptTurn")(
       function* (threadId, turnId) {
         const context = yield* ensureSessionContext(sessions, threadId);
+        const stoppedChildIds = yield* abortTrackedOpenCodeChildren(context);
+        yield* Effect.forEach(
+          stoppedChildIds,
+          (childId) => context.emitChildStopped(childId).pipe(Effect.ignore),
+          { concurrency: "unbounded", discard: true },
+        );
+        clearAbortingOpenCodeChildren(context, stoppedChildIds);
         yield* runOpenCodeSdk("session.abort", () =>
           context.client.session.abort({ sessionID: context.openCodeSessionId }),
         ).pipe(Effect.mapError(toRequestError));

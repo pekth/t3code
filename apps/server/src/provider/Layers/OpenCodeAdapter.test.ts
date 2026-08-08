@@ -50,6 +50,7 @@ type MessageEntry = {
   info: {
     id: string;
     role: "user" | "assistant";
+    [key: string]: unknown;
   };
   parts: Array<unknown>;
 };
@@ -61,13 +62,18 @@ const runtimeMock = {
     sessionCreateInputs: [] as Array<Record<string, unknown>>,
     authHeaders: [] as Array<string | null>,
     abortCalls: [] as string[],
+    abortFailures: new Set<string>(),
     closeCalls: [] as string[],
     revertCalls: [] as Array<{ sessionID: string; messageID?: string }>,
     promptCalls: [] as Array<unknown>,
     promptAsyncError: null as Error | null,
     closeError: null as Error | null,
     messages: [] as MessageEntry[],
+    childMessages: new Map<string, MessageEntry[]>(),
+    messageCalls: [] as string[],
     subscribedEvents: [] as unknown[],
+    sessionStatusCalls: [] as Array<{ directory?: string }>,
+    sessionStatusMap: {} as Record<string, unknown>,
     sessionGetIds: [] as string[],
     missingSessionIds: new Set<string>(),
     transientErrorSessionIds: new Set<string>(),
@@ -81,13 +87,18 @@ const runtimeMock = {
     this.state.sessionCreateInputs.length = 0;
     this.state.authHeaders.length = 0;
     this.state.abortCalls.length = 0;
+    this.state.abortFailures.clear();
     this.state.closeCalls.length = 0;
     this.state.revertCalls.length = 0;
     this.state.promptCalls.length = 0;
     this.state.promptAsyncError = null;
     this.state.closeError = null;
     this.state.messages = [];
+    this.state.childMessages.clear();
+    this.state.messageCalls.length = 0;
     this.state.subscribedEvents = [];
+    this.state.sessionStatusCalls.length = 0;
+    this.state.sessionStatusMap = {};
     this.state.sessionGetIds.length = 0;
     this.state.missingSessionIds.clear();
     this.state.transientErrorSessionIds.clear();
@@ -176,6 +187,9 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
         },
         abort: async ({ sessionID }: { sessionID: string }) => {
           runtimeMock.state.abortCalls.push(sessionID);
+          if (runtimeMock.state.abortFailures.has(sessionID)) {
+            throw new Error(`abort failed: ${sessionID}`);
+          }
         },
         promptAsync: async (input: unknown) => {
           runtimeMock.state.promptCalls.push(input);
@@ -183,7 +197,12 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
             throw runtimeMock.state.promptAsyncError;
           }
         },
-        messages: async () => ({ data: runtimeMock.state.messages }),
+        messages: async ({ sessionID }: { sessionID: string }) => {
+          runtimeMock.state.messageCalls.push(sessionID);
+          return {
+            data: runtimeMock.state.childMessages.get(sessionID) ?? runtimeMock.state.messages,
+          };
+        },
         revert: async ({ sessionID, messageID }: { sessionID: string; messageID?: string }) => {
           runtimeMock.state.revertCalls.push({
             sessionID,
@@ -201,6 +220,10 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
             targetIndex >= 0
               ? runtimeMock.state.messages.slice(0, targetIndex + 1)
               : runtimeMock.state.messages;
+        },
+        status: async ({ directory }: { directory?: string } = {}) => {
+          runtimeMock.state.sessionStatusCalls.push({ ...(directory ? { directory } : {}) });
+          return { data: runtimeMock.state.sessionStatusMap };
         },
       },
       event: {
@@ -279,6 +302,105 @@ beforeEach(() => {
 
 const advanceTestClock = (ms: number) =>
   TestClock.adjust(`${ms} millis`).pipe(Effect.andThen(Effect.yieldNow));
+
+const rootOpenCodeSessionId = "http://127.0.0.1:9999/session";
+
+const makeTaskPart = (input: {
+  readonly childId: string;
+  readonly partId: string;
+  readonly status: "running" | "completed" | "error";
+  readonly description?: string;
+  readonly role?: string;
+  readonly background?: boolean;
+  readonly parentSessionId?: string;
+}) => {
+  const description = input.description ?? "Review adapter behavior";
+  const role = input.role ?? "reviewer";
+  const metadata = {
+    parentSessionId: input.parentSessionId ?? rootOpenCodeSessionId,
+    sessionId: input.childId,
+    model: { providerID: "anthropic", modelID: "claude-sonnet-4-5" },
+    ...(input.background === true ? { background: true } : {}),
+  };
+  const taskInput = {
+    description,
+    prompt: "Inspect implementation",
+    subagent_type: role,
+    ...(input.background === true ? { background: true } : {}),
+  };
+  const state =
+    input.status === "running"
+      ? { status: "running", input: taskInput, title: description, time: { start: 1 }, metadata }
+      : input.status === "completed"
+        ? {
+            status: "completed",
+            input: taskInput,
+            output: "Task result",
+            title: description,
+            time: { start: 1, end: 2 },
+            metadata,
+          }
+        : {
+            status: "error",
+            input: taskInput,
+            error: "Task failed",
+            time: { start: 1, end: 2 },
+            metadata,
+          };
+  return {
+    id: input.partId,
+    sessionID: rootOpenCodeSessionId,
+    messageID: "root-assistant",
+    type: "tool",
+    callID: `${input.partId}-call`,
+    tool: "task",
+    state,
+  };
+};
+
+const childSessionCreated = (childId: string, parentID = rootOpenCodeSessionId) => ({
+  type: "session.created",
+  properties: {
+    sessionID: childId,
+    info: { id: childId, parentID },
+  },
+});
+
+const childSessionStatus = (
+  childId: string,
+  status: "busy" | "retry" | "idle",
+  id = `${childId}-${status}`,
+) => ({
+  id,
+  type: "session.status",
+  properties: {
+    sessionID: childId,
+    status:
+      status === "retry"
+        ? { type: "retry", attempt: 1, message: "retrying", next: 1 }
+        : { type: status },
+  },
+});
+
+const isChildActivity = (
+  event: { readonly type: string; readonly payload: unknown },
+  childId: string,
+): boolean => {
+  if (
+    event.type !== "task.started" &&
+    event.type !== "task.progress" &&
+    event.type !== "task.updated" &&
+    event.type !== "task.completed" &&
+    event.type !== "tool.progress"
+  ) {
+    return false;
+  }
+  const payload =
+    typeof event.payload === "object" && event.payload !== null
+      ? (event.payload as { readonly taskId?: unknown })
+      : undefined;
+  return String(payload?.taskId) === childId;
+};
 
 it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
   it.effect("reuses a configured OpenCode server URL instead of spawning a local server", () =>
@@ -1147,6 +1269,542 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       if (completed?.type === "item.completed") {
         NodeAssert.equal(completed.payload.detail, "A BBonus");
       }
+    }),
+  );
+
+  it.effect("keeps direct child traffic on task lifecycle without leaking child timeline rows", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-child-dispatch");
+      const childId = "child-safe-dispatch";
+      const childToolPart = {
+        id: "child-tool-part",
+        sessionID: childId,
+        messageID: "child-message",
+        type: "tool",
+        callID: "child-tool-call",
+        tool: "bash",
+        state: {
+          status: "running",
+          input: { command: "printf secret" },
+          title: "Running child command",
+          time: { start: 1 },
+        },
+      };
+      runtimeMock.state.sessionStatusMap = { [childId]: { type: "busy" } };
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({
+              childId,
+              partId: "root-task-part",
+              status: "running",
+            }),
+            time: 1,
+          },
+        },
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: childId,
+            info: { id: "child-message", role: "assistant" },
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: childId,
+            part: {
+              id: "child-text-part",
+              sessionID: childId,
+              messageID: "child-message",
+              type: "text",
+              text: "child assistant text must stay hidden",
+            },
+            time: 2,
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: childId,
+            part: childToolPart,
+            time: 3,
+          },
+        },
+        {
+          id: "child-error",
+          type: "session.error",
+          properties: {
+            sessionID: childId,
+            error: { data: { message: "child failed" } },
+          },
+        },
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.take(6),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      const childEvents = events.filter((event) => isChildActivity(event, childId));
+      NodeAssert.deepEqual(
+        childEvents.map((event) => event.type),
+        ["task.started", "tool.progress", "task.completed"],
+      );
+      NodeAssert.equal(events.some((event) => event.type === "content.delta"), false);
+      NodeAssert.equal(events.some((event) => event.type === "runtime.error"), false);
+      NodeAssert.equal(events.some((event) => event.type === "turn.completed"), false);
+      NodeAssert.equal(events.some((event) => event.type === "thread.metadata.updated"), false);
+      NodeAssert.equal(
+        events.filter(
+          (event) => event.type.startsWith("item.") && isChildActivity(event, childId),
+        ).length,
+        0,
+      );
+    }),
+  );
+
+  it.effect("maps one status map to busy, retry, and missing-child idle states", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-child-status-map");
+      const children = ["child-status-busy", "child-status-retry", "child-status-missing"];
+      runtimeMock.state.sessionStatusMap = {
+        [children[0]!]: { type: "busy" },
+        [children[1]!]: { type: "retry", attempt: 1, message: "retrying", next: 1 },
+      };
+      runtimeMock.state.subscribedEvents = children.map((childId, index) => ({
+        type: "message.part.updated",
+        properties: {
+          sessionID: rootOpenCodeSessionId,
+          part: makeTaskPart({ childId, partId: `status-part-${index}`, status: "running" }),
+          time: index + 1,
+        },
+      }));
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => children.some((childId) => isChildActivity(event, childId))),
+        Stream.take(5),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      const statusEvents = events.filter((event) => event.type === "task.updated");
+      NodeAssert.deepEqual(
+        statusEvents.map((event) => (event.payload as { status?: string }).status),
+        ["waiting", "idle"],
+      );
+      NodeAssert.equal(
+        events.filter((event) => event.type === "task.started").length,
+        3,
+      );
+      NodeAssert.equal(runtimeMock.state.sessionStatusCalls.length, 1);
+      NodeAssert.deepEqual(runtimeMock.state.messageCalls, children);
+    }),
+  );
+
+  it.effect("keeps background completion idle while foreground completion is terminal", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-child-background");
+      const foreground = "child-foreground";
+      const background = "child-background";
+      runtimeMock.state.sessionStatusMap = { [foreground]: { type: "busy" } };
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({ childId: foreground, partId: "foreground-part", status: "running" }),
+            time: 1,
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({
+              childId: background,
+              partId: "background-part",
+              status: "running",
+              background: true,
+            }),
+            time: 2,
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({ childId: foreground, partId: "foreground-part", status: "completed" }),
+            time: 3,
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({
+              childId: background,
+              partId: "background-part",
+              status: "completed",
+              background: true,
+            }),
+            time: 4,
+          },
+        },
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => isChildActivity(event, foreground) || isChildActivity(event, background)),
+        Stream.take(4),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      const completed = events.filter((event) => event.type === "task.completed");
+      NodeAssert.equal(completed.length, 1);
+      NodeAssert.equal(
+        completed[0]?.type === "task.completed" && String(completed[0].payload.taskId) === foreground,
+        true,
+      );
+      NodeAssert.equal(
+        events.some(
+          (event) =>
+            event.type === "task.updated" &&
+            String((event.payload as { taskId?: unknown }).taskId) === background &&
+            (event.payload as { status?: string }).status === "idle",
+        ),
+        true,
+      );
+      NodeAssert.equal(
+        events.some(
+          (event) =>
+            event.type === "task.completed" &&
+            String((event.payload as { taskId?: unknown }).taskId) === background,
+        ),
+        false,
+      );
+    }),
+  );
+
+  it.effect("reactivates one child id with an explicit running update", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-child-resume");
+      const childId = "child-resume";
+      runtimeMock.state.sessionStatusMap = { [childId]: { type: "busy" } };
+      runtimeMock.state.childMessages.set(childId, [
+        {
+          info: {
+            id: "previous-assistant",
+            role: "assistant",
+            time: { created: 1, completed: 2 },
+          },
+          parts: [],
+        },
+      ]);
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({ childId, partId: "resume-part-1", status: "running" }),
+            time: 1,
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({ childId, partId: "resume-part-1", status: "completed" }),
+            time: 2,
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({ childId, partId: "resume-part-2", status: "running" }),
+            time: 3,
+          },
+        },
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => isChildActivity(event, childId)),
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      NodeAssert.equal(events.filter((event) => event.type === "task.started").length, 1);
+      NodeAssert.equal(
+        events.some(
+          (event) =>
+            event.type === "task.updated" &&
+            (event.payload as { status?: string }).status === "running",
+        ),
+        true,
+      );
+      NodeAssert.equal(
+        events.every((event) => String((event.payload as { taskId?: unknown }).taskId) === childId),
+        true,
+      );
+      NodeAssert.equal(events.filter((event) => event.type === "task.completed").length, 1);
+      NodeAssert.equal(runtimeMock.state.sessionStatusCalls.length, 2);
+    }),
+  );
+
+  it.effect("keeps child terminal failures first during late success and idle noise", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-child-terminal-race");
+      const childId = "child-terminal-race";
+      const childError = {
+        id: "terminal-race-error",
+        type: "session.error",
+        properties: {
+          sessionID: childId,
+          error: { data: { message: "child failed first" } },
+        },
+      };
+      runtimeMock.state.sessionStatusMap = { [childId]: { type: "busy" } };
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({ childId, partId: "terminal-race-part", status: "running" }),
+            time: 1,
+          },
+        },
+        childError,
+        childError,
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({ childId, partId: "terminal-race-part", status: "completed" }),
+            time: 2,
+          },
+        },
+        childSessionStatus(childId, "idle", "terminal-race-idle"),
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => isChildActivity(event, childId)),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      const terminals = events.filter((event) => event.type === "task.completed");
+      NodeAssert.equal(terminals.length, 1);
+      NodeAssert.equal(
+        terminals[0]?.type === "task.completed" && terminals[0].payload.status === "failed",
+        true,
+      );
+    }),
+  );
+
+  it.effect("aborts every tracked child but claims stopped only for acknowledged idle children", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-child-stop-truth");
+      const stoppedChild = "child-stop-ack";
+      const liveChild = "child-stop-failed";
+      runtimeMock.state.sessionStatusMap = {
+        [stoppedChild]: { type: "busy" },
+        [liveChild]: { type: "busy" },
+      };
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({ childId: stoppedChild, partId: "stop-part-a", status: "running" }),
+            time: 1,
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({ childId: liveChild, partId: "stop-part-b", status: "running" }),
+            time: 2,
+          },
+        },
+      ];
+
+      const startsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter(
+          (event) =>
+            event.type === "task.started" &&
+            (String((event.payload as { taskId?: unknown }).taskId) === stoppedChild ||
+              String((event.payload as { taskId?: unknown }).taskId) === liveChild),
+        ),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      yield* Fiber.join(startsFiber).pipe(Effect.timeout("1 second"));
+
+      runtimeMock.state.sessionStatusMap = {
+        [stoppedChild]: { type: "idle" },
+        [liveChild]: { type: "busy" },
+      };
+      runtimeMock.state.abortFailures.add(liveChild);
+      const stoppedFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.type === "task.completed"),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.interruptTurn(threadId);
+      const stoppedEvents = Array.from(
+        yield* Fiber.join(stoppedFiber).pipe(Effect.timeout("1 second")),
+      );
+
+      NodeAssert.equal(runtimeMock.state.abortCalls.includes(rootOpenCodeSessionId), true);
+      NodeAssert.equal(runtimeMock.state.abortCalls.includes(stoppedChild), true);
+      NodeAssert.equal(runtimeMock.state.abortCalls.includes(liveChild), true);
+      NodeAssert.equal(stoppedEvents.length, 1);
+      NodeAssert.equal(
+        stoppedEvents[0]?.type === "task.completed" &&
+          String(stoppedEvents[0].payload.taskId) === stoppedChild &&
+          stoppedEvents[0].payload.status === "stopped",
+        true,
+      );
+    }),
+  );
+
+  it.effect("hydrates pre-link child events once and deduplicates replayed tool/status events", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-child-hydration");
+      const childId = "child-hydration";
+      const childToolPart = {
+        id: "hydration-tool-part",
+        sessionID: childId,
+        messageID: "hydration-message",
+        type: "tool",
+        callID: "hydration-tool-call",
+        tool: "bash",
+        state: {
+          status: "running",
+          input: { command: "printf hydration" },
+          title: "Hydrating child tool",
+          time: { start: 4 },
+        },
+      };
+      runtimeMock.state.childMessages.set(childId, [
+        {
+          info: { id: "hydration-message", role: "assistant", time: { created: 1 } },
+          parts: [childToolPart],
+        },
+      ]);
+      runtimeMock.state.sessionStatusMap = { [childId]: { type: "busy" } };
+      runtimeMock.state.subscribedEvents = [
+        childSessionCreated("foreign-child", "foreign-root"),
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: "foreign-child",
+            part: childToolPart,
+            time: 1,
+          },
+        },
+        childSessionCreated(childId),
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: childId,
+            info: { id: "hydration-message", role: "assistant" },
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: childId,
+            part: childToolPart,
+            time: 4,
+          },
+        },
+        childSessionStatus(childId, "busy", "hydration-status"),
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({ childId, partId: "hydration-root-part", status: "running" }),
+            time: 5,
+          },
+        },
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => isChildActivity(event, childId)),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      NodeAssert.deepEqual(events.map((event) => event.type), ["task.started", "tool.progress"]);
+      const started = events[0];
+      NodeAssert.equal(started?.type === "task.started" && started.payload.title, "Review adapter behavior");
+      NodeAssert.equal(started?.type === "task.started" && started.payload.role, "reviewer");
+      NodeAssert.equal(
+        started?.type === "task.started" && started.payload.timelineBypass,
+        true,
+      );
+      NodeAssert.deepEqual(runtimeMock.state.messageCalls, [childId]);
+      NodeAssert.equal(runtimeMock.state.sessionStatusCalls.length, 1);
     }),
   );
 
