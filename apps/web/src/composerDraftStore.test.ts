@@ -767,6 +767,26 @@ describe("composerDraftStore project draft thread mapping", () => {
     });
   });
 
+  it("rotates a draft to a fresh thread id and drops a stale promotion reference", () => {
+    const store = useComposerDraftStore.getState();
+    store.setProjectDraftThreadId(projectRef, draftId, { threadId, branch: "main" });
+    // The rolled-back provisional thread briefly marked the draft as promoted.
+    store.markDraftThreadPromoting(draftId, scopeThreadRef(TEST_ENVIRONMENT_ID, threadId));
+    store.setPrompt(draftId, "preserved prompt");
+
+    const rotated = useComposerDraftStore.getState().rotateDraftThreadId(draftId);
+
+    expect(rotated).not.toBeNull();
+    expect(rotated).not.toEqual(threadId);
+    const draft = useComposerDraftStore.getState().getDraftThread(draftId);
+    expect(draft?.threadId).toEqual(rotated);
+    expect(draft?.promotedTo).toBeNull();
+    expect(draft?.branch).toBe("main");
+    expect(useComposerDraftStore.getState().getComposerDraft(draftId)?.prompt).toBe(
+      "preserved prompt",
+    );
+  });
+
   it("clears only matching project draft mapping entries", () => {
     const store = useComposerDraftStore.getState();
     store.setProjectDraftThreadId(projectRef, draftId, { threadId });

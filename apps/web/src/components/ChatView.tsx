@@ -4915,7 +4915,12 @@ function ChatViewContent(props: ChatViewProps) {
       );
       return;
     }
-    const threadIdForSend = activeThread.id;
+    const threadIdForSend = isLocalDraftThread
+      ? (useComposerDraftStore
+          .getState()
+          .rotateDraftThreadId(scopeThreadRef(activeThread.environmentId, activeThread.id)) ??
+        activeThread.id)
+      : activeThread.id;
     const isFirstMessage = !isServerThread || activeThread.messages.length === 0;
     const baseBranchForWorktree =
       isFirstMessage && sendEnvMode === "worktree" && !activeThread.worktreePath

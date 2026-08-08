@@ -156,7 +156,24 @@ export function requireThreadAbsent(input: {
   readonly command: OrchestrationCommand;
   readonly threadId: ThreadId;
 }): Effect.Effect<void, OrchestrationCommandInvariantError> {
-  if (!findThreadById(input.readModel, input.threadId)) {
+  const existing = findThreadById(input.readModel, input.threadId);
+  if (!existing) {
+    return Effect.void;
+  }
+  // A failed thread bootstrap compensates its provisional thread.create with
+  // a thread.delete. That delete is a soft tombstone: the aggregate stays in
+  // the decider read model, so retrying the same draft's first send is
+  // permanently rejected. A deleted thread that never lived (no message,
+  // turn, activity, or session) is a spent creation attempt, not a real
+  // thread — allow re-creating the aggregate so the draft can recover.
+  if (
+    existing.deletedAt !== null &&
+    existing.messages.length === 0 &&
+    existing.activities.length === 0 &&
+    existing.checkpoints.length === 0 &&
+    existing.latestTurn === null &&
+    existing.session === null
+  ) {
     return Effect.void;
   }
   return Effect.fail(

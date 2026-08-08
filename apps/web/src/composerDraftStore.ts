@@ -45,6 +45,7 @@ import {
   elementContextDedupKey,
   newElementContextId,
 } from "./lib/elementContext";
+import { newThreadId } from "./lib/utils";
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 import { useShallow } from "zustand/react/shallow";
@@ -390,6 +391,14 @@ interface ComposerDraftStoreState {
       interactionMode?: ProviderInteractionMode;
     },
   ) => void;
+  /**
+   * Rotates a draft session to a fresh thread aggregate id, dropping any stale
+   * promotion reference. Called when a first-send bootstrap failed and the
+   * provisional server thread was rolled back, so the next send does not retry
+   * a tombstoned id that the server rejects with "already exists". Returns the
+   * fresh id, or null when there is no draft session to rotate.
+   */
+  rotateDraftThreadId: (threadRef: ComposerThreadTarget) => ThreadId | null;
   clearProjectDraftThreadId: (projectRef: ScopedProjectRef) => void;
   clearProjectDraftThreadById: (
     projectRef: ScopedProjectRef,
@@ -2402,6 +2411,35 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
               },
             };
           });
+        },
+        rotateDraftThreadId: (threadRef) => {
+          const threadKey = resolveComposerDraftKey(get(), threadRef);
+          if (!threadKey) {
+            return null;
+          }
+          const existing = get().draftThreadsByThreadKey[threadKey];
+          if (!existing) {
+            return null;
+          }
+          const nextThreadId = newThreadId();
+          if (nextThreadId === existing.threadId) {
+            return nextThreadId;
+          }
+          set((state) => ({
+            draftThreadsByThreadKey: {
+              ...state.draftThreadsByThreadKey,
+              [threadKey]: {
+                ...existing,
+                threadId: nextThreadId,
+                // The rolled-back provisional thread may briefly have been
+                // marked promoted while it existed; a rotated id must drop
+                // that stale reference or the draft loses its project
+                // association in the UI.
+                promotedTo: null,
+              },
+            },
+          }));
+          return nextThreadId;
         },
         clearProjectDraftThreadId: (projectRef) => {
           set((state) => {

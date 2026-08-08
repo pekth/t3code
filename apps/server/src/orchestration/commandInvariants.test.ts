@@ -201,6 +201,131 @@ describe("commandInvariants", () => {
     ).rejects.toThrow("already exists");
   });
 
+  it("allows re-creating a deleted thread that never lived (bootstrap rollback tombstone)", async () => {
+    const tombstonedReadModel: OrchestrationReadModel = {
+      ...readModel,
+      threads: [
+        {
+          id: ThreadId.make("thread-1"),
+          projectId: ProjectId.make("project-a"),
+          title: "Thread A",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("codex"),
+            model: "gpt-5-codex",
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "full-access",
+          branch: "main",
+          worktreePath: null,
+          createdAt: now,
+          updatedAt: now,
+          archivedAt: null,
+          settledOverride: null,
+          settledAt: null,
+          latestTurn: null,
+          messages: [],
+          session: null,
+          activities: [],
+          proposedPlans: [],
+          checkpoints: [],
+          deletedAt: now,
+        },
+      ],
+    };
+
+    await Effect.runPromise(
+      requireThreadAbsent({
+        readModel: tombstonedReadModel,
+        command: {
+          type: "thread.create",
+          commandId: CommandId.make("cmd-recreate"),
+          threadId: ThreadId.make("thread-1"),
+          projectId: ProjectId.make("project-a"),
+          title: "retry",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("codex"),
+            model: "gpt-5-codex",
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "full-access",
+          branch: "main",
+          worktreePath: null,
+          createdAt: now,
+        },
+        threadId: ThreadId.make("thread-1"),
+      }),
+    );
+  });
+
+  it("still rejects re-creating a deleted thread that had real activity", async () => {
+    const deletedWithContent: OrchestrationReadModel = {
+      ...readModel,
+      threads: [
+        {
+          id: ThreadId.make("thread-1"),
+          projectId: ProjectId.make("project-a"),
+          title: "Thread A",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("codex"),
+            model: "gpt-5-codex",
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "full-access",
+          branch: "main",
+          worktreePath: null,
+          createdAt: now,
+          updatedAt: now,
+          archivedAt: null,
+          settledOverride: null,
+          settledAt: null,
+          latestTurn: null,
+          messages: [
+            {
+              id: MessageId.make("msg-deleted"),
+              role: "user",
+              text: "hello",
+              turnId: null,
+              streaming: false,
+              attachments: [],
+              createdAt: now,
+              updatedAt: now,
+            },
+          ],
+          session: null,
+          activities: [],
+          proposedPlans: [],
+          checkpoints: [],
+          deletedAt: now,
+        },
+      ],
+    };
+
+    await expect(
+      Effect.runPromise(
+        requireThreadAbsent({
+          readModel: deletedWithContent,
+          command: {
+            type: "thread.create",
+            commandId: CommandId.make("cmd-recreate-content"),
+            threadId: ThreadId.make("thread-1"),
+            projectId: ProjectId.make("project-a"),
+            title: "retry",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("codex"),
+              model: "gpt-5-codex",
+            },
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: "full-access",
+            branch: "main",
+            worktreePath: null,
+            createdAt: now,
+          },
+          threadId: ThreadId.make("thread-1"),
+        }),
+      ),
+    ).rejects.toThrow("already exists");
+  });
+
   it("requires non-negative integers", async () => {
     await Effect.runPromise(
       requireNonNegativeInteger({
