@@ -16,6 +16,7 @@ import * as TestClock from "effect/testing/TestClock";
 import { beforeEach } from "vite-plus/test";
 
 import {
+  ApprovalRequestId,
   OpenCodeSettings,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -2147,6 +2148,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const adapter = yield* OpenCodeAdapter;
       const threadId = asThreadId("thread-opencode-child-terminal-race");
       const childId = "child-terminal-race";
+      const latePermissionId = ApprovalRequestId.make("late-terminal-permission");
       const childError = {
         id: "terminal-race-error",
         type: "session.error",
@@ -2166,6 +2168,16 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
           },
         },
         childError,
+        {
+          type: "permission.asked",
+          properties: {
+            sessionID: childId,
+            id: latePermissionId,
+            permission: "bash",
+            patterns: ["printf late"],
+            metadata: { command: "printf late" },
+          },
+        },
         {
           type: "message.part.updated",
           properties: {
@@ -2218,6 +2230,11 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         terminals[0]?.type === "task.completed" && terminals[0].payload.status === "failed",
         true,
       );
+      yield* Effect.yieldNow;
+      const lateRequest = yield* Effect.exit(
+        adapter.respondToRequest(threadId, latePermissionId, "accept"),
+      );
+      NodeAssert.equal(Exit.isFailure(lateRequest), true);
     }),
   );
 
@@ -2226,8 +2243,10 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const adapter = yield* OpenCodeAdapter;
       const threadId = asThreadId("thread-opencode-child-requests");
       const childId = "child-requests";
-      const permissionId = "child-permission";
-      const questionId = "child-question";
+      const permissionId = ApprovalRequestId.make("child-permission");
+      const secondPermissionId = ApprovalRequestId.make("child-permission-2");
+      const questionId = ApprovalRequestId.make("child-question");
+      const secondQuestionId = ApprovalRequestId.make("child-question-2");
       runtimeMock.state.sessionStatusMap = { [childId]: { type: "busy" } };
       runtimeMock.state.subscribedEvents = [
         {
@@ -2248,6 +2267,16 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
           },
         },
         {
+          type: "permission.asked",
+          properties: {
+            sessionID: childId,
+            id: secondPermissionId,
+            permission: "edit",
+            patterns: ["src/app.ts"],
+            metadata: { command: "write file" },
+          },
+        },
+        {
           type: "question.asked",
           properties: {
             sessionID: childId,
@@ -2262,13 +2291,28 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
             ],
           },
         },
+        {
+          type: "question.asked",
+          properties: {
+            sessionID: childId,
+            id: secondQuestionId,
+            questions: [
+              {
+                header: "Mode",
+                question: "Which mode?",
+                options: [{ label: "Safe", description: "Use safe mode" }],
+                multiple: false,
+              },
+            ],
+          },
+        },
       ];
 
       const requestsFiber = yield* adapter.streamEvents.pipe(
         Stream.filter(
           (event) => event.type === "request.opened" || event.type === "user-input.requested",
         ),
-        Stream.take(2),
+        Stream.take(4),
         Stream.runCollect,
         Effect.forkChild,
       );
@@ -2281,17 +2325,25 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const requests = Array.from(yield* Fiber.join(requestsFiber).pipe(Effect.timeout("1 second")));
       NodeAssert.deepEqual(requests.map((event) => event.type), [
         "request.opened",
+        "request.opened",
+        "user-input.requested",
         "user-input.requested",
       ]);
       yield* adapter.respondToRequest(threadId, permissionId, "accept");
+      yield* adapter.respondToRequest(threadId, secondPermissionId, "accept");
       yield* adapter.respondToUserInput(threadId, questionId, {
         "question-0-mode": "Fast",
       });
+      yield* adapter.respondToUserInput(threadId, secondQuestionId, {
+        "question-0-mode": "Safe",
+      });
       NodeAssert.deepEqual(runtimeMock.state.permissionReplyCalls, [
         { requestID: permissionId, reply: "once" },
+        { requestID: secondPermissionId, reply: "once" },
       ]);
       NodeAssert.deepEqual(runtimeMock.state.questionReplyCalls, [
         { requestID: questionId, answers: [["Fast"]] },
+        { requestID: secondQuestionId, answers: [["Safe"]] },
       ]);
     }),
   );

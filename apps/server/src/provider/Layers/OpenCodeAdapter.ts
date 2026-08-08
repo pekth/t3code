@@ -310,6 +310,7 @@ function openCodeChildEventKey(event: OpenCodeSubscribedEvent): string {
     openCodeString(part?.id) ??
     openCodeString(info?.id) ??
     openCodeString(properties?.messageID) ??
+    openCodeString(properties?.id) ??
     openCodeString(properties?.requestID) ??
     status;
   const infoSnapshot = info ? `:${JSON.stringify(info)}` : "";
@@ -1044,12 +1045,20 @@ export function makeOpenCodeAdapter(
         return;
       }
       child.lastStatus = status;
+      const eventBase = yield* buildEventBase({
+        threadId: context.session.threadId,
+        turnId,
+        raw,
+      });
+      if (
+        (yield* Ref.get(context.stopped)) ||
+        context.abortingChildIds.has(child.id) ||
+        child.terminalStatus
+      ) {
+        return;
+      }
       yield* emit({
-        ...(yield* buildEventBase({
-          threadId: context.session.threadId,
-          turnId,
-          raw,
-        })),
+        ...eventBase,
         type: "task.updated",
         payload: {
           ...linkage,
@@ -1112,13 +1121,21 @@ export function makeOpenCodeAdapter(
         return;
       }
       child.lastToolFingerprint = fingerprint;
+      const eventBase = yield* buildEventBase({
+        threadId: context.session.threadId,
+        turnId,
+        itemId: part.callID,
+        raw,
+      });
+      if (
+        (yield* Ref.get(context.stopped)) ||
+        context.abortingChildIds.has(child.id) ||
+        child.terminalStatus
+      ) {
+        return;
+      }
       yield* emit({
-        ...(yield* buildEventBase({
-          threadId: context.session.threadId,
-          turnId,
-          itemId: part.callID,
-          raw,
-        })),
+        ...eventBase,
         type: "tool.progress",
         payload: {
           taskId: linkage.taskId,
@@ -1146,13 +1163,21 @@ export function makeOpenCodeAdapter(
       if (!linkage || context.abortingChildIds.has(child.id) || child.terminalStatus) {
         return;
       }
+      const eventBase = yield* buildEventBase({
+        threadId: context.session.threadId,
+        turnId,
+        raw,
+      });
+      if (
+        (yield* Ref.get(context.stopped)) ||
+        context.abortingChildIds.has(child.id) ||
+        child.terminalStatus
+      ) {
+        return;
+      }
       child.terminalStatus = status;
       yield* emit({
-        ...(yield* buildEventBase({
-          threadId: context.session.threadId,
-          turnId,
-          raw,
-        })),
+        ...eventBase,
         type: "task.completed",
         payload: {
           ...linkage,
@@ -1205,6 +1230,9 @@ export function makeOpenCodeAdapter(
           break;
         }
         case "permission.asked":
+          if (child.terminalStatus) {
+            break;
+          }
           yield* emitChildStatus(context, child, "waiting", turnId, event);
           context.pendingPermissions.set(event.properties.id, event.properties);
           yield* emit({
@@ -1242,6 +1270,9 @@ export function makeOpenCodeAdapter(
           });
           break;
         case "question.asked":
+          if (child.terminalStatus) {
+            break;
+          }
           yield* emitChildStatus(context, child, "waiting", turnId, event);
           context.pendingQuestions.set(event.properties.id, event.properties);
           yield* emit({
