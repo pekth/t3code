@@ -1291,6 +1291,15 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
           time: { start: 1 },
         },
       };
+      const completedChildToolPart = {
+        ...childToolPart,
+        state: {
+          ...childToolPart.state,
+          status: "completed",
+          output: "secret",
+          time: { start: 1, end: 2 },
+        },
+      };
       runtimeMock.state.sessionStatusMap = { [childId]: { type: "busy" } };
       runtimeMock.state.subscribedEvents = [
         {
@@ -1335,6 +1344,14 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
           },
         },
         {
+          type: "message.part.updated",
+          properties: {
+            sessionID: childId,
+            part: completedChildToolPart,
+            time: 4,
+          },
+        },
+        {
           id: "child-error",
           type: "session.error",
           properties: {
@@ -1345,8 +1362,8 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       ];
 
       const eventsFiber = yield* adapter.streamEvents.pipe(
-        Stream.filter((event) => event.threadId === threadId),
-        Stream.take(6),
+        Stream.filter((event) => isChildActivity(event, childId)),
+        Stream.take(4),
         Stream.runCollect,
         Effect.forkChild,
       );
@@ -1360,7 +1377,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const childEvents = events.filter((event) => isChildActivity(event, childId));
       NodeAssert.deepEqual(
         childEvents.map((event) => event.type),
-        ["task.started", "tool.progress", "task.completed"],
+        ["task.started", "tool.progress", "tool.progress", "task.completed"],
       );
       NodeAssert.equal(events.some((event) => event.type === "content.delta"), false);
       NodeAssert.equal(events.some((event) => event.type === "runtime.error"), false);
@@ -1585,6 +1602,80 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("keeps reactivated idle children resumable after prior completion", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-child-resume-idle");
+      const childId = "child-resume-idle";
+      runtimeMock.state.childMessages.set(childId, [
+        {
+          info: {
+            id: "previous-assistant",
+            role: "assistant",
+            time: { created: 1, completed: 2 },
+          },
+          parts: [],
+        },
+      ]);
+      runtimeMock.state.sessionStatusMap = { [childId]: { type: "idle" } };
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({ childId, partId: "resume-idle-part-1", status: "running" }),
+            time: 1,
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({ childId, partId: "resume-idle-part-1", status: "completed" }),
+            time: 2,
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({ childId, partId: "resume-idle-part-2", status: "running" }),
+            time: 3,
+          },
+        },
+        childSessionStatus(childId, "busy", "resume-idle-busy"),
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => isChildActivity(event, childId)),
+        Stream.take(6),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      NodeAssert.deepEqual(events.map((event) => event.type), [
+        "task.started",
+        "task.updated",
+        "task.completed",
+        "task.updated",
+        "task.updated",
+        "task.updated",
+      ]);
+      NodeAssert.deepEqual(
+        events
+          .filter((event) => event.type === "task.updated")
+          .map((event) => (event.payload as { status?: string }).status),
+        ["idle", "running", "idle", "running"],
+      );
+    }),
+  );
+
   it.effect("keeps child terminal failures first during late success and idle noise", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
@@ -1609,6 +1700,26 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
           },
         },
         childError,
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: childId,
+            part: {
+              id: "late-tool-part",
+              sessionID: childId,
+              messageID: "late-tool-message",
+              type: "tool",
+              callID: "late-tool-call",
+              tool: "bash",
+              state: {
+                status: "running",
+                input: { command: "printf late" },
+                title: "Late child tool",
+                time: { start: 3 },
+              },
+            },
+          },
+        },
         childError,
         {
           type: "message.part.updated",
@@ -1636,6 +1747,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
       const terminals = events.filter((event) => event.type === "task.completed");
       NodeAssert.equal(terminals.length, 1);
+      NodeAssert.equal(events.some((event) => event.type === "tool.progress"), false);
       NodeAssert.equal(
         terminals[0]?.type === "task.completed" && terminals[0].payload.status === "failed",
         true,

@@ -299,13 +299,19 @@ function openCodeChildEventKey(event: OpenCodeSubscribedEvent): string {
   const part = openCodeRecord(properties?.part);
   const info = openCodeRecord(properties?.info);
   const status = openCodeString(openCodeRecord(properties?.status)?.type);
+  const partState = openCodeRecord(part?.state);
+  const partStatus = openCodeString(partState?.status);
+  const partTime = openCodeRecord(partState?.time);
+  const partStateKey = partStatus
+    ? `:${partStatus}:${JSON.stringify(partTime ?? null)}`
+    : "";
   const stableId =
     openCodeString(part?.id) ??
     openCodeString(info?.id) ??
     openCodeString(properties?.messageID) ??
     openCodeString(properties?.requestID) ??
     status;
-  return `${event.type}:${stableId ?? "event"}`;
+  return `${event.type}:${stableId ?? "event"}${partStateKey}`;
 }
 
 function openCodeChildLinkage(child: OpenCodeChildContext) {
@@ -1229,6 +1235,7 @@ export function makeOpenCodeAdapter(
       context: OpenCodeSessionContext,
       child: OpenCodeChildContext,
       turnId: TurnId | undefined,
+      inferTerminalFromHistory: boolean,
     ) {
       const messages = yield* runOpenCodeSdk("session.messages", () =>
         context.client.session.messages({
@@ -1284,7 +1291,12 @@ export function makeOpenCodeAdapter(
       for (const event of bufferedEvents) {
         yield* handleChildSubscribedEvent(context, child, event);
       }
-      if (hydratedIdle && child.lastStatus === "idle" && !child.terminalStatus) {
+      if (
+        inferTerminalFromHistory &&
+        hydratedIdle &&
+        child.lastStatus === "idle" &&
+        !child.terminalStatus
+      ) {
         if (latestAssistantError !== undefined) {
           yield* emitChildCompleted(
             context,
@@ -1358,7 +1370,7 @@ export function makeOpenCodeAdapter(
       }
 
       if (isNewLink || isNewActivation) {
-        yield* hydrateChild(context, child, turnId);
+        yield* hydrateChild(context, child, turnId, !isNewActivation);
       }
 
       if (!context.abortingChildIds.has(child.id)) {
