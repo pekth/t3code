@@ -63,6 +63,9 @@ const runtimeMock = {
     authHeaders: [] as Array<string | null>,
     abortCalls: [] as string[],
     abortFailures: new Set<string>(),
+    abortHangs: new Set<string>(),
+    permissionReplyCalls: [] as Array<{ requestID: string; reply: string }>,
+    questionReplyCalls: [] as Array<{ requestID: string; answers: unknown }>,
     closeCalls: [] as string[],
     revertCalls: [] as Array<{ sessionID: string; messageID?: string }>,
     promptCalls: [] as Array<unknown>,
@@ -90,6 +93,9 @@ const runtimeMock = {
     this.state.authHeaders.length = 0;
     this.state.abortCalls.length = 0;
     this.state.abortFailures.clear();
+    this.state.abortHangs.clear();
+    this.state.permissionReplyCalls.length = 0;
+    this.state.questionReplyCalls.length = 0;
     this.state.closeCalls.length = 0;
     this.state.revertCalls.length = 0;
     this.state.promptCalls.length = 0;
@@ -191,6 +197,9 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
         },
         abort: async ({ sessionID }: { sessionID: string }) => {
           runtimeMock.state.abortCalls.push(sessionID);
+          if (runtimeMock.state.abortHangs.has(sessionID)) {
+            return await new Promise<void>(() => undefined);
+          }
           if (runtimeMock.state.abortFailures.has(sessionID)) {
             throw new Error(`abort failed: ${sessionID}`);
           }
@@ -235,6 +244,16 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
             runtimeMock.state.sessionStatusMaps[runtimeMock.state.sessionStatusCalls.length - 1] ??
             runtimeMock.state.sessionStatusMap;
           return { data: statusMap };
+        },
+      },
+      permission: {
+        reply: async ({ requestID, reply }: { requestID: string; reply: string }) => {
+          runtimeMock.state.permissionReplyCalls.push({ requestID, reply });
+        },
+      },
+      question: {
+        reply: async ({ requestID, answers }: { requestID: string; answers: unknown }) => {
+          runtimeMock.state.questionReplyCalls.push({ requestID, answers });
         },
       },
       event: {
@@ -2199,6 +2218,162 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         terminals[0]?.type === "task.completed" && terminals[0].payload.status === "failed",
         true,
       );
+    }),
+  );
+
+  it.effect("routes child approval and user-input requests through adapter responses", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-child-requests");
+      const childId = "child-requests";
+      const permissionId = "child-permission";
+      const questionId = "child-question";
+      runtimeMock.state.sessionStatusMap = { [childId]: { type: "busy" } };
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({ childId, partId: "child-request-task", status: "running" }),
+          },
+        },
+        {
+          type: "permission.asked",
+          properties: {
+            sessionID: childId,
+            id: permissionId,
+            permission: "bash",
+            patterns: ["git status"],
+            metadata: { command: "git status" },
+          },
+        },
+        {
+          type: "question.asked",
+          properties: {
+            sessionID: childId,
+            id: questionId,
+            questions: [
+              {
+                header: "Mode",
+                question: "Which mode?",
+                options: [{ label: "Fast", description: "Use fast mode" }],
+                multiple: false,
+              },
+            ],
+          },
+        },
+      ];
+
+      const requestsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter(
+          (event) => event.type === "request.opened" || event.type === "user-input.requested",
+        ),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const requests = Array.from(yield* Fiber.join(requestsFiber).pipe(Effect.timeout("1 second")));
+      NodeAssert.deepEqual(requests.map((event) => event.type), [
+        "request.opened",
+        "user-input.requested",
+      ]);
+      yield* adapter.respondToRequest(threadId, permissionId, "accept");
+      yield* adapter.respondToUserInput(threadId, questionId, {
+        "question-0-mode": "Fast",
+      });
+      NodeAssert.deepEqual(runtimeMock.state.permissionReplyCalls, [
+        { requestID: permissionId, reply: "once" },
+      ]);
+      NodeAssert.deepEqual(runtimeMock.state.questionReplyCalls, [
+        { requestID: questionId, answers: [["Fast"]] },
+      ]);
+    }),
+  );
+
+  it.effect("lets current child status override buffered status events", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-child-current-status");
+      const childId = "child-current-status";
+      runtimeMock.state.sessionStatusMap = { [childId]: { type: "busy" } };
+      runtimeMock.state.subscribedEvents = [
+        childSessionCreated(childId),
+        childSessionStatus(childId, "idle", "buffered-child-idle"),
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({ childId, partId: "current-status-task", status: "running" }),
+          },
+        },
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => isChildActivity(event, childId)),
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      NodeAssert.deepEqual(events.map((event) => event.type), [
+        "task.started",
+        "task.updated",
+        "task.updated",
+      ]);
+      NodeAssert.deepEqual(
+        events
+          .filter((event) => event.type === "task.updated")
+          .map((event) => (event.payload as { status?: string }).status),
+        ["idle", "running"],
+      );
+    }),
+  );
+
+  it.effect("does not let a hung child abort block parent interruption", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-child-abort-timeout");
+      const childId = "child-abort-timeout";
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({ childId, partId: "abort-timeout-task", status: "running" }),
+          },
+        },
+      ];
+      const startedFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.type === "task.started"),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      yield* Fiber.join(startedFiber).pipe(Effect.timeout("1 second"));
+
+      runtimeMock.state.abortHangs.add(childId);
+      const interruptFiber = yield* adapter.interruptTurn(threadId).pipe(Effect.forkChild);
+      yield* advanceTestClock(5_000);
+      yield* Fiber.join(interruptFiber).pipe(Effect.timeout("1 second"));
+      NodeAssert.equal(runtimeMock.state.abortCalls.includes(childId), true);
+      NodeAssert.equal(runtimeMock.state.abortCalls.includes(rootOpenCodeSessionId), true);
     }),
   );
 
