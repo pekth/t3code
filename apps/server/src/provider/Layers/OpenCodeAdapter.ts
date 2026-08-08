@@ -1224,7 +1224,6 @@ export function makeOpenCodeAdapter(
         context.childStatusMap = undefined;
         context.childStatusMapLoaded = false;
       }
-      context.childStatusMapLoaded = true;
       const statusMap = yield* runOpenCodeSdk("session.status", () =>
         context.client.session.status({ directory: context.directory }),
       ).pipe(
@@ -1235,7 +1234,10 @@ export function makeOpenCodeAdapter(
           ).pipe(Effect.as(undefined)),
         ),
       );
-      context.childStatusMap = statusMap;
+      if (statusMap !== undefined) {
+        context.childStatusMap = statusMap;
+        context.childStatusMapLoaded = true;
+      }
       return statusMap;
     });
 
@@ -1268,14 +1270,11 @@ export function makeOpenCodeAdapter(
           }
         }
       }
-      if (hydrateToolProgress && latestToolPart) {
-        yield* emitChildToolProgress(context, child, latestToolPart, turnId);
-      }
-
       const statusMap = yield* loadChildStatusMap(context, child.id);
+      let statusType: "busy" | "retry" | "idle" | undefined;
       if (statusMap) {
         const providerStatus = statusMap[child.id];
-        const statusType =
+        statusType =
           providerStatus === undefined ? "idle" : openCodeProviderStatusType(providerStatus);
         if (statusType === "busy") {
           yield* emitChildStatus(context, child, "running", turnId);
@@ -1284,6 +1283,9 @@ export function makeOpenCodeAdapter(
         } else if (statusType === "idle") {
           yield* emitChildStatus(context, child, "idle", turnId);
         }
+      }
+      if (hydrateToolProgress && latestToolPart && statusType === "busy") {
+        yield* emitChildToolProgress(context, child, latestToolPart, turnId);
       }
 
       const bufferedEvents = child.bufferedEvents.splice(0);

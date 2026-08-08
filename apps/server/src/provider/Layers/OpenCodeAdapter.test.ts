@@ -73,6 +73,7 @@ const runtimeMock = {
     messageCalls: [] as string[],
     subscribedEvents: [] as unknown[],
     sessionStatusCalls: [] as Array<{ directory?: string }>,
+    sessionStatusFailures: 0,
     sessionStatusMap: {} as Record<string, unknown>,
     sessionStatusMaps: [] as Array<Record<string, unknown>>,
     sessionGetIds: [] as string[],
@@ -99,6 +100,7 @@ const runtimeMock = {
     this.state.messageCalls.length = 0;
     this.state.subscribedEvents = [];
     this.state.sessionStatusCalls.length = 0;
+    this.state.sessionStatusFailures = 0;
     this.state.sessionStatusMap = {};
     this.state.sessionStatusMaps.length = 0;
     this.state.sessionGetIds.length = 0;
@@ -225,6 +227,10 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
         },
         status: async ({ directory }: { directory?: string } = {}) => {
           runtimeMock.state.sessionStatusCalls.push({ ...(directory ? { directory } : {}) });
+          if (runtimeMock.state.sessionStatusFailures > 0) {
+            runtimeMock.state.sessionStatusFailures -= 1;
+            throw new Error("session.status failed");
+          }
           const statusMap =
             runtimeMock.state.sessionStatusMaps[runtimeMock.state.sessionStatusCalls.length - 1] ??
             runtimeMock.state.sessionStatusMap;
@@ -1561,6 +1567,121 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       );
       NodeAssert.equal(events.some((event) => event.type === "task.completed"), false);
       NodeAssert.equal(runtimeMock.state.sessionStatusCalls.length, 2);
+    }),
+  );
+
+  it.effect("does not hydrate completed tool progress for idle children", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-child-idle-tool");
+      const childId = "child-idle-tool";
+      runtimeMock.state.childMessages.set(childId, [
+        {
+          info: { id: "idle-tool-message", role: "assistant", time: { created: 1, completed: 2 } },
+          parts: [
+            {
+              id: "idle-tool-part",
+              sessionID: childId,
+              messageID: "idle-tool-message",
+              type: "tool",
+              callID: "idle-tool-call",
+              tool: "bash",
+              state: {
+                status: "completed",
+                input: { command: "printf stale" },
+                output: "stale",
+                title: "Stale child tool",
+                time: { start: 1, end: 2 },
+              },
+            },
+          ],
+        },
+      ]);
+      runtimeMock.state.sessionStatusMap = { [childId]: { type: "idle" } };
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({ childId, partId: "idle-tool-task", status: "running" }),
+            time: 1,
+          },
+        },
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => isChildActivity(event, childId)),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      NodeAssert.deepEqual(events.map((event) => event.type), ["task.started", "task.updated"]);
+      NodeAssert.equal(events.some((event) => event.type === "tool.progress"), false);
+      NodeAssert.equal(
+        events[1]?.type === "task.updated" && events[1].payload.status === "idle",
+        true,
+      );
+    }),
+  );
+
+  it.effect("retries child status hydration after a failed status request", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-child-status-retry");
+      const firstChild = "child-status-retry-first";
+      const lateChild = "child-status-retry-late";
+      runtimeMock.state.sessionStatusFailures = 1;
+      runtimeMock.state.sessionStatusMap = {
+        [lateChild]: { type: "retry", attempt: 1, message: "retrying", next: 1 },
+      };
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({ childId: firstChild, partId: "status-retry-first", status: "running" }),
+            time: 1,
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({ childId: lateChild, partId: "status-retry-late", status: "running" }),
+            time: 2,
+          },
+        },
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter(
+          (event) => isChildActivity(event, firstChild) || isChildActivity(event, lateChild),
+        ),
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      NodeAssert.equal(runtimeMock.state.sessionStatusCalls.length, 2);
+      NodeAssert.deepEqual(
+        events
+          .filter((event) => event.type === "task.updated")
+          .map((event) => (event.payload as { status?: string }).status),
+        ["waiting"],
+      );
     }),
   );
 
