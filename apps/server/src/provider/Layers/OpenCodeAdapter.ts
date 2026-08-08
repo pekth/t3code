@@ -1031,6 +1031,9 @@ export function makeOpenCodeAdapter(
       turnId: TurnId | undefined,
       raw?: unknown,
     ) {
+      if (yield* Ref.get(context.stopped)) {
+        return;
+      }
       const linkage = openCodeChildLinkage(child);
       if (
         !linkage ||
@@ -1061,17 +1064,24 @@ export function makeOpenCodeAdapter(
       turnId: TurnId | undefined,
       raw?: unknown,
     ) {
+      if (yield* Ref.get(context.stopped)) {
+        return;
+      }
       const linkage = openCodeChildLinkage(child);
       if (!linkage || context.abortingChildIds.has(child.id)) {
         return;
       }
       child.lastStatus = "running";
+      const eventBase = yield* buildEventBase({
+        threadId: context.session.threadId,
+        turnId,
+        raw,
+      });
+      if (yield* Ref.get(context.stopped)) {
+        return;
+      }
       yield* emit({
-        ...(yield* buildEventBase({
-          threadId: context.session.threadId,
-          turnId,
-          raw,
-        })),
+        ...eventBase,
         type: "task.started",
         payload: linkage,
       });
@@ -1084,6 +1094,9 @@ export function makeOpenCodeAdapter(
       turnId: TurnId | undefined,
       raw?: unknown,
     ) {
+      if (yield* Ref.get(context.stopped)) {
+        return;
+      }
       const linkage = openCodeChildLinkage(child);
       if (!linkage || context.abortingChildIds.has(child.id) || child.terminalStatus) {
         return;
@@ -1126,6 +1139,9 @@ export function makeOpenCodeAdapter(
       raw?: unknown,
       summary?: string,
     ) {
+      if (yield* Ref.get(context.stopped)) {
+        return;
+      }
       const linkage = openCodeChildLinkage(child);
       if (!linkage || context.abortingChildIds.has(child.id) || child.terminalStatus) {
         return;
@@ -1150,7 +1166,11 @@ export function makeOpenCodeAdapter(
       context: OpenCodeSessionContext,
       child: OpenCodeChildContext,
       event: OpenCodeSubscribedEvent,
+      currentStatusType?: "busy" | "retry" | "idle",
     ) {
+      if (yield* Ref.get(context.stopped)) {
+        return;
+      }
       if (
         !child.linked ||
         context.abortingChildIds.has(child.id) ||
@@ -1161,7 +1181,12 @@ export function makeOpenCodeAdapter(
       const turnId = context.activeTurnId;
       switch (event.type) {
         case "message.updated": {
-          if (event.properties.info.role === "assistant" && event.properties.info.error) {
+          if (
+            currentStatusType !== "busy" &&
+            currentStatusType !== "retry" &&
+            event.properties.info.role === "assistant" &&
+            event.properties.info.error
+          ) {
             yield* emitChildCompleted(
               context,
               child,
@@ -1268,14 +1293,16 @@ export function makeOpenCodeAdapter(
           yield* emitChildStatus(context, child, "idle", turnId, event);
           break;
         case "session.error":
-          yield* emitChildCompleted(
-            context,
-            child,
-            "failed",
-            turnId,
-            event,
-            sessionErrorMessage(event.properties.error),
-          );
+          if (currentStatusType !== "busy" && currentStatusType !== "retry") {
+            yield* emitChildCompleted(
+              context,
+              child,
+              "failed",
+              turnId,
+              event,
+              sessionErrorMessage(event.properties.error),
+            );
+          }
           break;
         default:
           break;
@@ -1342,27 +1369,33 @@ export function makeOpenCodeAdapter(
           }
         }
       }
-      const bufferedEvents = child.bufferedEvents.splice(0);
-      child.bufferedEventKeys.clear();
-      for (const event of bufferedEvents) {
-        yield* handleChildSubscribedEvent(context, child, event);
-      }
-
       const statusMap = yield* loadChildStatusMap(context, child.id);
       let statusType: "busy" | "retry" | "idle" | undefined;
       if (statusMap) {
         const providerStatus = statusMap[child.id];
         statusType =
           providerStatus === undefined ? "idle" : openCodeProviderStatusType(providerStatus);
-        if (statusType === "busy") {
-          yield* emitChildStatus(context, child, "running", turnId);
-        } else if (statusType === "retry") {
-          yield* emitChildStatus(context, child, "waiting", turnId);
-        } else if (statusType === "idle") {
-          yield* emitChildStatus(context, child, "idle", turnId);
-        }
       }
-      if (hydrateToolProgress && latestToolPart && statusType === "busy") {
+
+      const bufferedEvents = child.bufferedEvents.splice(0);
+      child.bufferedEventKeys.clear();
+      for (const event of bufferedEvents) {
+        yield* handleChildSubscribedEvent(context, child, event, statusType);
+      }
+
+      if (statusType === "busy") {
+        yield* emitChildStatus(context, child, "running", turnId);
+      } else if (statusType === "retry") {
+        yield* emitChildStatus(context, child, "waiting", turnId);
+      } else if (statusType === "idle") {
+        yield* emitChildStatus(context, child, "idle", turnId);
+      }
+      if (
+        hydrateToolProgress &&
+        latestToolPart &&
+        statusType === "busy" &&
+        (latestToolPart.state.status === "pending" || latestToolPart.state.status === "running")
+      ) {
         yield* emitChildToolProgress(context, child, latestToolPart, turnId);
       }
     });
@@ -1374,7 +1407,10 @@ export function makeOpenCodeAdapter(
       turnId: TurnId | undefined,
       raw: unknown,
     ) {
-      if (link.parentSessionId !== context.openCodeSessionId) {
+      if (
+        (yield* Ref.get(context.stopped)) ||
+        link.parentSessionId !== context.openCodeSessionId
+      ) {
         return;
       }
       let child = context.children.get(link.childId);
@@ -1432,7 +1468,7 @@ export function makeOpenCodeAdapter(
         }
       }
 
-      if (isNewLink || isNewActivation) {
+      if ((isNewLink || isNewActivation) && !(yield* Ref.get(context.stopped))) {
         yield* hydrateChild(context, child, turnId, !isNewActivation);
       }
     });
