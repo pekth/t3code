@@ -74,6 +74,7 @@ const runtimeMock = {
     subscribedEvents: [] as unknown[],
     sessionStatusCalls: [] as Array<{ directory?: string }>,
     sessionStatusMap: {} as Record<string, unknown>,
+    sessionStatusMaps: [] as Array<Record<string, unknown>>,
     sessionGetIds: [] as string[],
     missingSessionIds: new Set<string>(),
     transientErrorSessionIds: new Set<string>(),
@@ -99,6 +100,7 @@ const runtimeMock = {
     this.state.subscribedEvents = [];
     this.state.sessionStatusCalls.length = 0;
     this.state.sessionStatusMap = {};
+    this.state.sessionStatusMaps.length = 0;
     this.state.sessionGetIds.length = 0;
     this.state.missingSessionIds.clear();
     this.state.transientErrorSessionIds.clear();
@@ -223,7 +225,10 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
         },
         status: async ({ directory }: { directory?: string } = {}) => {
           runtimeMock.state.sessionStatusCalls.push({ ...(directory ? { directory } : {}) });
-          return { data: runtimeMock.state.sessionStatusMap };
+          const statusMap =
+            runtimeMock.state.sessionStatusMaps[runtimeMock.state.sessionStatusCalls.length - 1] ??
+            runtimeMock.state.sessionStatusMap;
+          return { data: statusMap };
         },
       },
       event: {
@@ -1432,8 +1437,179 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         events.filter((event) => event.type === "task.started").length,
         3,
       );
-      NodeAssert.equal(runtimeMock.state.sessionStatusCalls.length, 1);
+      NodeAssert.equal(runtimeMock.state.sessionStatusCalls.length, 2);
       NodeAssert.deepEqual(runtimeMock.state.messageCalls, children);
+    }),
+  );
+
+  it.effect("refreshes status coverage for children linked after hydration", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-child-status-refresh");
+      const firstChild = "child-status-first";
+      const lateChild = "child-status-late";
+      runtimeMock.state.sessionStatusMaps = [
+        { [firstChild]: { type: "retry", attempt: 1, message: "retrying", next: 1 } },
+        { [firstChild]: { type: "retry", attempt: 1, message: "retrying", next: 1 }, [lateChild]: { type: "busy" } },
+      ];
+      runtimeMock.state.childMessages.set(lateChild, [
+        {
+          info: {
+            id: "late-previous-assistant",
+            role: "assistant",
+            time: { created: 1, completed: 2 },
+          },
+          parts: [],
+        },
+      ]);
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({ childId: firstChild, partId: "status-first-part", status: "running" }),
+            time: 1,
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({ childId: lateChild, partId: "status-late-part", status: "running" }),
+            time: 2,
+          },
+        },
+        childSessionStatus(lateChild, "retry", "status-late-retry"),
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter(
+          (event) => isChildActivity(event, firstChild) || isChildActivity(event, lateChild),
+        ),
+        Stream.take(4),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      NodeAssert.deepEqual(
+        events
+          .filter((event) => event.type === "task.updated")
+          .map((event) => (event.payload as { status?: string }).status),
+        ["waiting", "waiting"],
+      );
+      NodeAssert.equal(events.some((event) => event.type === "task.completed"), false);
+      NodeAssert.equal(runtimeMock.state.sessionStatusCalls.length, 2);
+    }),
+  );
+
+  it.effect("keeps first-linked children resumable when history is already complete", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-child-first-link-resume");
+      const childId = "child-first-link-resume";
+      runtimeMock.state.childMessages.set(childId, [
+        {
+          info: {
+            id: "first-link-previous-assistant",
+            role: "assistant",
+            time: { created: 1, completed: 2 },
+          },
+          parts: [],
+        },
+      ]);
+      runtimeMock.state.sessionStatusMap = { [childId]: { type: "idle" } };
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({ childId, partId: "first-link-part", status: "running" }),
+            time: 1,
+          },
+        },
+        childSessionStatus(childId, "busy", "first-link-busy"),
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => isChildActivity(event, childId)),
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      NodeAssert.deepEqual(events.map((event) => event.type), [
+        "task.started",
+        "task.updated",
+        "task.updated",
+      ]);
+      NodeAssert.deepEqual(
+        events
+          .filter((event) => event.type === "task.updated")
+          .map((event) => (event.payload as { status?: string }).status),
+        ["idle", "running"],
+      );
+      NodeAssert.equal(events.some((event) => event.type === "task.completed"), false);
+    }),
+  );
+
+  it.effect("applies current task failure before hydration state", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-child-current-failure");
+      const childId = "child-current-failure";
+      runtimeMock.state.childMessages.set(childId, [
+        {
+          info: {
+            id: "current-failure-previous-assistant",
+            role: "assistant",
+            time: { created: 1, completed: 2 },
+          },
+          parts: [],
+        },
+      ]);
+      runtimeMock.state.sessionStatusMap = { [childId]: { type: "idle" } };
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootOpenCodeSessionId,
+            part: makeTaskPart({ childId, partId: "current-failure-part", status: "error" }),
+            time: 1,
+          },
+        },
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => isChildActivity(event, childId)),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      NodeAssert.deepEqual(events.map((event) => event.type), ["task.started", "task.completed"]);
+      NodeAssert.equal(
+        events[1]?.type === "task.completed" &&
+          (events[1].payload as { status?: string }).status === "failed",
+        true,
+      );
     }),
   );
 

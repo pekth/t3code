@@ -1059,7 +1059,7 @@ export function makeOpenCodeAdapter(
       raw?: unknown,
     ) {
       const linkage = openCodeChildLinkage(child);
-      if (!linkage) {
+      if (!linkage || context.abortingChildIds.has(child.id)) {
         return;
       }
       child.lastStatus = "running";
@@ -1082,7 +1082,7 @@ export function makeOpenCodeAdapter(
       raw?: unknown,
     ) {
       const linkage = openCodeChildLinkage(child);
-      if (!linkage || context.abortingChildIds.has(child.id)) {
+      if (!linkage || context.abortingChildIds.has(child.id) || child.terminalStatus) {
         return;
       }
       const fingerprint = `${part.id}:${part.tool}:${part.state.status}:${
@@ -1214,7 +1214,14 @@ export function makeOpenCodeAdapter(
       childId: string,
     ) {
       if (context.childStatusMapLoaded) {
-        return context.childStatusMap;
+        if (
+          context.childStatusMap === undefined ||
+          Object.prototype.hasOwnProperty.call(context.childStatusMap, childId)
+        ) {
+          return context.childStatusMap;
+        }
+        context.childStatusMap = undefined;
+        context.childStatusMapLoaded = false;
       }
       context.childStatusMapLoaded = true;
       const statusMap = yield* runOpenCodeSdk("session.status", () =>
@@ -1235,7 +1242,6 @@ export function makeOpenCodeAdapter(
       context: OpenCodeSessionContext,
       child: OpenCodeChildContext,
       turnId: TurnId | undefined,
-      inferTerminalFromHistory: boolean,
     ) {
       const messages = yield* runOpenCodeSdk("session.messages", () =>
         context.client.session.messages({
@@ -1250,15 +1256,9 @@ export function makeOpenCodeAdapter(
         ),
       );
 
-      let latestAssistantError: unknown;
-      let latestAssistantCompleted = false;
       let latestToolPart: Extract<Part, { type: "tool" }> | undefined;
       if (messages !== undefined) {
         for (const entry of messages) {
-          if (entry.info.role === "assistant") {
-            latestAssistantError = entry.info.error;
-            latestAssistantCompleted = entry.info.time.completed !== undefined;
-          }
           for (const part of entry.parts) {
             if (part.type === "tool") {
               latestToolPart = part;
@@ -1271,7 +1271,6 @@ export function makeOpenCodeAdapter(
       }
 
       const statusMap = yield* loadChildStatusMap(context, child.id);
-      let hydratedIdle = false;
       if (statusMap) {
         const providerStatus = statusMap[child.id];
         const statusType =
@@ -1281,7 +1280,6 @@ export function makeOpenCodeAdapter(
         } else if (statusType === "retry") {
           yield* emitChildStatus(context, child, "waiting", turnId);
         } else if (statusType === "idle") {
-          hydratedIdle = true;
           yield* emitChildStatus(context, child, "idle", turnId);
         }
       }
@@ -1290,25 +1288,6 @@ export function makeOpenCodeAdapter(
       child.bufferedEventKeys.clear();
       for (const event of bufferedEvents) {
         yield* handleChildSubscribedEvent(context, child, event);
-      }
-      if (
-        inferTerminalFromHistory &&
-        hydratedIdle &&
-        child.lastStatus === "idle" &&
-        !child.terminalStatus
-      ) {
-        if (latestAssistantError !== undefined) {
-          yield* emitChildCompleted(
-            context,
-            child,
-            "failed",
-            turnId,
-            undefined,
-            sessionErrorMessage(latestAssistantError),
-          );
-        } else if (latestAssistantCompleted && !child.background) {
-          yield* emitChildCompleted(context, child, "completed", turnId);
-        }
       }
     });
 
@@ -1369,16 +1348,16 @@ export function makeOpenCodeAdapter(
         yield* emitChildStarted(context, child, turnId, raw);
       }
 
-      if (isNewLink || isNewActivation) {
-        yield* hydrateChild(context, child, turnId, !isNewActivation);
-      }
-
       if (!context.abortingChildIds.has(child.id)) {
         if (part.state.status === "error") {
           yield* emitChildCompleted(context, child, "failed", turnId, raw, part.state.error);
         } else if (part.state.status === "completed" && !child.background) {
           yield* emitChildCompleted(context, child, "completed", turnId, raw, part.state.output);
         }
+      }
+
+      if (isNewLink || isNewActivation) {
+        yield* hydrateChild(context, child, turnId);
       }
     });
 
