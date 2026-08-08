@@ -406,6 +406,47 @@ describe("deriveAgentPanelModel", () => {
     ).toEqual(["direct-a", "direct-b"]);
   });
 
+  it("sorts live direct spawns above settled ones regardless of spawn order", () => {
+    const roster = fold([
+      activity(
+        "task.started",
+        { taskId: "settled-a", title: "Old done" },
+        "2026-08-01T11:00:00.000Z",
+      ),
+      activity(
+        "task.completed",
+        { taskId: "settled-a", status: "completed" },
+        "2026-08-01T11:00:10.000Z",
+      ),
+      activity(
+        "task.started",
+        { taskId: "running-b", title: "New live" },
+        "2026-08-01T11:00:05.000Z",
+      ),
+    ]);
+
+    const ids = deriveAgentPanelModel({ agents: roster }).directAgents.map((agent) => agent.id);
+    // running-b spawned after settled-a but must surface above it.
+    expect(ids).toEqual(["running-b", "settled-a"]);
+  });
+
+  it("sorts live workflows above settled ones", () => {
+    const roster = fold([
+      activity("task.started", { taskId: "wf-done", taskType: "local_workflow", title: "done" }),
+      activity("task.completed", {
+        taskId: "wf-done",
+        taskType: "local_workflow",
+        status: "completed",
+      }),
+      activity("task.started", { taskId: "wf-live", taskType: "local_workflow", title: "live" }),
+    ]);
+
+    const ids = deriveAgentPanelModel({ agents: roster }).workflows.map(
+      (group) => group.workflow.id,
+    );
+    expect(ids).toEqual(["wf-live", "wf-done"]);
+  });
+
   it("keeps first-seen order after the roster retention ranking runs", () => {
     const starts = Array.from({ length: 101 }, (_, index) =>
       activity(

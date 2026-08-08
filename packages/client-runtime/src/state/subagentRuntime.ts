@@ -104,6 +104,22 @@ export function isActiveSubagentStatus(status: RuntimeSubagentStatus): boolean {
   return status === "pending" || status === "running" || status === "waiting";
 }
 
+/**
+ * Roster urgency: live work first (running/pending), then things that need the
+ * user (waiting, failed), then idle, then settled. Rows only move when their
+ * status changes — never on activity or token ticks — so the panel stays
+ * stable while still keeping running work visible instead of burying it under
+ * older settled rows (spawn-order-only sorting put every fresh Codex batch at
+ * the bottom).
+ */
+function agentPanelUrgency(status: RuntimeSubagentStatus): number {
+  if (status === "running" || status === "pending") return 0;
+  if (status === "waiting") return 1;
+  if (status === "failed") return 2;
+  if (status === "idle") return 3;
+  return 4;
+}
+
 const RECENT_ACTIVITY_LIMIT = 6;
 const SUMMARY_CHAR_LIMIT = 180;
 const ROSTER_LIMIT = 100;
@@ -738,7 +754,12 @@ export function deriveAgentPanelModel({
   const workflows = source
     .filter((agent) => agent.kind === "workflow")
     .slice()
-    .sort((a, b) => a.firstSeenAt.localeCompare(b.firstSeenAt) || a.id.localeCompare(b.id));
+    .sort(
+      (a, b) =>
+        agentPanelUrgency(a.status) - agentPanelUrgency(b.status) ||
+        a.firstSeenAt.localeCompare(b.firstSeenAt) ||
+        a.id.localeCompare(b.id),
+    );
   const workflowIds = new Set(workflows.map((workflow) => workflow.id));
   const members = new Map<string, RuntimeSubagent[]>();
   const direct: RuntimeSubagent[] = [];
@@ -839,11 +860,16 @@ export function deriveAgentPanelModel({
 
   return {
     workflows: workflowGroups,
-    // Updates and the >100-agent retention ranking must never reshuffle rows
-    // that remain visible.
+    // Urgency first keeps live work on top; firstSeenAt is the stable
+    // tiebreaker so a status change is the only thing that moves a row.
     directAgents: direct
       .slice()
-      .sort((a, b) => a.firstSeenAt.localeCompare(b.firstSeenAt) || a.id.localeCompare(b.id)),
+      .sort(
+        (a, b) =>
+          agentPanelUrgency(a.status) - agentPanelUrgency(b.status) ||
+          a.firstSeenAt.localeCompare(b.firstSeenAt) ||
+          a.id.localeCompare(b.id),
+      ),
     runningCount,
     waitingCount,
     idleCount,
