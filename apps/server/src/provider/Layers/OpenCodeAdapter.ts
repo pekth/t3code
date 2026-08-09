@@ -1626,10 +1626,7 @@ export function makeOpenCodeAdapter(
           child.hydrating = false;
           return;
         }
-        yield* hydrateChild(context, child, turnId, !isNewActivation).pipe(
-          Effect.forkIn(context.sessionScope),
-          Effect.asVoid,
-        );
+        yield* hydrateChild(context, child, turnId, !isNewActivation);
       }
     });
 
