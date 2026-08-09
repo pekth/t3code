@@ -699,7 +699,7 @@ const abortTrackedOpenCodeChildren = Effect.fn("abortTrackedOpenCodeChildren")(f
       ).pipe(
         Effect.timeout(OPENCODE_CHILD_ABORT_TIMEOUT),
         Effect.map(() => ({ childId, aborted: true })),
-        Effect.catch(() => Effect.succeed({ childId, aborted: false })),
+        Effect.orElseSucceed(() => ({ childId, aborted: false })),
       ),
     { concurrency: "unbounded" },
   );
@@ -715,7 +715,7 @@ const abortTrackedOpenCodeChildren = Effect.fn("abortTrackedOpenCodeChildren")(f
     context.client.session.status({ directory: context.directory }),
   ).pipe(
     Effect.map((response) => openCodeRecord(response.data)),
-    Effect.catch(() => Effect.succeed(undefined)),
+    Effect.orElseSucceed(() => undefined),
   );
   if (!statusMap) {
     clearAbortingOpenCodeChildren(context, childIds);
@@ -1466,7 +1466,7 @@ export function makeOpenCodeAdapter(
             ).pipe(Effect.as(undefined)),
           ),
           Effect.timeout(OPENCODE_CHILD_HYDRATION_TIMEOUT),
-          Effect.catch(() => Effect.succeed(undefined)),
+          Effect.orElseSucceed(() => undefined),
         );
 
         let latestToolPart: Extract<Part, { type: "tool" }> | undefined;
@@ -1483,7 +1483,7 @@ export function makeOpenCodeAdapter(
           .withPermit(loadChildStatusMap(context, child.id))
           .pipe(
             Effect.timeout(OPENCODE_CHILD_HYDRATION_TIMEOUT),
-            Effect.catch(() => Effect.succeed(undefined)),
+            Effect.orElseSucceed(() => undefined),
           );
         let statusType: "busy" | "retry" | "idle" | undefined;
         if (statusMap) {
@@ -1649,7 +1649,7 @@ export function makeOpenCodeAdapter(
           ).pipe(Effect.as(undefined)),
         ),
         Effect.timeout(OPENCODE_CHILD_HYDRATION_TIMEOUT),
-        Effect.catch(() => Effect.succeed(undefined)),
+        Effect.orElseSucceed(() => undefined),
       );
       if (!messages) {
         return;
@@ -1665,7 +1665,7 @@ export function makeOpenCodeAdapter(
           ).pipe(Effect.as(undefined)),
         ),
         Effect.timeout(OPENCODE_CHILD_HYDRATION_TIMEOUT),
-        Effect.catch(() => Effect.succeed(undefined)),
+        Effect.orElseSucceed(() => undefined),
       );
       if (statusMap !== undefined) {
         context.childStatusMap = statusMap;
@@ -2073,18 +2073,16 @@ export function makeOpenCodeAdapter(
         return;
       }
       const turnId = context.activeTurnId;
-      const writeNative = Effect.gen(function* () {
-        yield* writeNativeEventBestEffort(context.session.threadId, {
-          observedAt: yield* nowIso,
-          event: {
-            provider: PROVIDER,
-            threadId: context.session.threadId,
-            providerThreadId: payloadSessionId,
-            type: event.type,
-            ...(turnId ? { turnId } : {}),
-            payload: event,
-          },
-        });
+      const writeNative = writeNativeEventBestEffort(context.session.threadId, {
+        observedAt: yield* nowIso,
+        event: {
+          provider: PROVIDER,
+          threadId: context.session.threadId,
+          providerThreadId: payloadSessionId,
+          type: event.type,
+          ...(turnId ? { turnId } : {}),
+          payload: event,
+        },
       });
 
       if (payloadSessionId === context.openCodeSessionId) {

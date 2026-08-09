@@ -236,7 +236,7 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
               : runtimeMock.state.messages;
         },
         status: async ({ directory }: { directory?: string } = {}) => {
-          runtimeMock.state.sessionStatusCalls.push({ ...(directory ? { directory } : {}) });
+          runtimeMock.state.sessionStatusCalls.push(directory ? { directory } : {});
           if (runtimeMock.state.sessionStatusFailures > 0) {
             runtimeMock.state.sessionStatusFailures -= 1;
             throw new Error("session.status failed");
