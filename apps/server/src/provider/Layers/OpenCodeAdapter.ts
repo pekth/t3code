@@ -1509,7 +1509,9 @@ export function makeOpenCodeAdapter(
             child,
             event,
             event.type === "session.error" ||
-              (event.type === "message.updated" && event.properties.info.error)
+              (event.type === "message.updated" &&
+                "error" in event.properties.info &&
+                event.properties.info.error)
               ? undefined
               : statusType,
           );
@@ -1523,7 +1525,9 @@ export function makeOpenCodeAdapter(
             child,
             event,
             event.type === "session.error" ||
-              (event.type === "message.updated" && event.properties.info.error)
+              (event.type === "message.updated" &&
+                "error" in event.properties.info &&
+                event.properties.info.error)
               ? undefined
               : statusType,
           );
