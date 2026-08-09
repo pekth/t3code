@@ -24,6 +24,7 @@ import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import type { OpencodeClient, Part, PermissionRequest, QuestionRequest } from "@opencode-ai/sdk/v2";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
@@ -232,11 +233,15 @@ interface OpenCodeChildContext {
   readonly bufferedEvents: Array<OpenCodeSubscribedEvent>;
   readonly bufferedEventKeys: Set<string>;
   readonly seenEventKeys: Set<string>;
+  preLinkBufferedEventCount: number;
+  hydrating: boolean;
 }
 
 const OPENCODE_CHILD_EVENT_BUFFER_LIMIT = 64;
 const OPENCODE_CHILD_EVENT_KEY_LIMIT = 256;
 const OPENCODE_CHILD_ABORT_TIMEOUT = "5 seconds";
+const OPENCODE_CHILD_HYDRATION_TIMEOUT = "5 seconds";
+const OPENCODE_ROOT_HISTORY_LIMIT = 128;
 
 function openCodeRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -290,6 +295,10 @@ function openCodeProviderStatusType(value: unknown): "busy" | "retry" | "idle" |
   return type === "busy" || type === "retry" || type === "idle" ? type : undefined;
 }
 
+function isOpenCodeChildControlEvent(event: OpenCodeSubscribedEvent): boolean {
+  return event.type === "permission.asked" || event.type === "question.asked";
+}
+
 function openCodeChildEventKey(event: OpenCodeSubscribedEvent): string {
   const eventId = "id" in event ? openCodeString(event.id) : undefined;
   if (eventId) {
@@ -303,9 +312,7 @@ function openCodeChildEventKey(event: OpenCodeSubscribedEvent): string {
   const partState = openCodeRecord(part?.state);
   const partStatus = openCodeString(partState?.status);
   const partTime = openCodeRecord(partState?.time);
-  const partStateKey = partStatus
-    ? `:${partStatus}:${JSON.stringify(partTime ?? null)}`
-    : "";
+  const partStateKey = partStatus ? `:${partStatus}:${JSON.stringify(partTime ?? null)}` : "";
   const stableId =
     openCodeString(part?.id) ??
     openCodeString(info?.id) ??
@@ -346,6 +353,8 @@ interface OpenCodeSessionContext {
   readonly completedAssistantPartIds: Set<string>;
   readonly children: Map<string, OpenCodeChildContext>;
   readonly abortingChildIds: Set<string>;
+  readonly childStopPendingIds: Set<string>;
+  readonly childHydrationSemaphore: Semaphore.Semaphore;
   childStatusMap: Readonly<Record<string, unknown>> | undefined;
   childStatusMapLoaded: boolean;
   emitChildStopped: (childId: string) => Effect.Effect<void>;
@@ -685,14 +694,18 @@ const abortTrackedOpenCodeChildren = Effect.fn("abortTrackedOpenCodeChildren")(f
   const attempts = yield* Effect.forEach(
     childIds,
     (childId) =>
-      runOpenCodeSdk("session.abort", () => context.client.session.abort({ sessionID: childId })).pipe(
+      runOpenCodeSdk("session.abort", () =>
+        context.client.session.abort({ sessionID: childId }),
+      ).pipe(
         Effect.timeout(OPENCODE_CHILD_ABORT_TIMEOUT),
         Effect.map(() => ({ childId, aborted: true })),
         Effect.catch(() => Effect.succeed({ childId, aborted: false })),
       ),
     { concurrency: "unbounded" },
   );
-  const abortedIds = attempts.filter((attempt) => attempt.aborted).map((attempt) => attempt.childId);
+  const abortedIds = attempts
+    .filter((attempt) => attempt.aborted)
+    .map((attempt) => attempt.childId);
   if (abortedIds.length === 0) {
     clearAbortingOpenCodeChildren(context, childIds);
     return [] as string[];
@@ -717,9 +730,21 @@ const abortTrackedOpenCodeChildren = Effect.fn("abortTrackedOpenCodeChildren")(f
     const status = statusMap[childId];
     return status === undefined || openCodeProviderStatusType(status) === "idle";
   });
+  const pendingChildIds = abortedIds.filter((childId) => {
+    const statusType = openCodeProviderStatusType(statusMap[childId]);
+    return statusType === "busy" || statusType === "retry";
+  });
+  for (const childId of stoppedChildIds) {
+    context.childStopPendingIds.delete(childId);
+  }
+  for (const childId of pendingChildIds) {
+    context.childStopPendingIds.add(childId);
+  }
   clearAbortingOpenCodeChildren(
     context,
-    childIds.filter((childId) => !stoppedChildIds.includes(childId)),
+    childIds.filter(
+      (childId) => !stoppedChildIds.includes(childId) && !pendingChildIds.includes(childId),
+    ),
   );
   return stoppedChildIds;
 });
@@ -1013,13 +1038,28 @@ export function makeOpenCodeAdapter(
       return true;
     };
 
-    const bufferChildEvent = (child: OpenCodeChildContext, event: OpenCodeSubscribedEvent): void => {
+    const bufferChildEvent = (
+      child: OpenCodeChildContext,
+      event: OpenCodeSubscribedEvent,
+    ): void => {
       const key = openCodeChildEventKey(event);
       if (child.bufferedEventKeys.has(key)) {
         return;
       }
       if (child.bufferedEvents.length >= OPENCODE_CHILD_EVENT_BUFFER_LIMIT) {
-        return;
+        if (!isOpenCodeChildControlEvent(event)) {
+          return;
+        }
+        const discardIndex = child.bufferedEvents.findIndex(
+          (bufferedEvent) => !isOpenCodeChildControlEvent(bufferedEvent),
+        );
+        if (discardIndex < 0) {
+          return;
+        }
+        const [discarded] = child.bufferedEvents.splice(discardIndex, 1);
+        if (discarded) {
+          child.bufferedEventKeys.delete(openCodeChildEventKey(discarded));
+        }
       }
       child.bufferedEvents.push(event);
       child.bufferedEventKeys.add(key);
@@ -1033,6 +1073,10 @@ export function makeOpenCodeAdapter(
       raw?: unknown,
     ) {
       if (yield* Ref.get(context.stopped)) {
+        return;
+      }
+      if (status === "idle" && context.childStopPendingIds.has(child.id)) {
+        yield* context.emitChildStopped(child.id);
         return;
       }
       const linkage = openCodeChildLinkage(child);
@@ -1086,7 +1130,11 @@ export function makeOpenCodeAdapter(
         turnId,
         raw,
       });
-      if (yield* Ref.get(context.stopped)) {
+      if (
+        (yield* Ref.get(context.stopped)) ||
+        context.abortingChildIds.has(child.id) ||
+        child.terminalStatus
+      ) {
         return;
       }
       yield* emit({
@@ -1309,6 +1357,19 @@ export function makeOpenCodeAdapter(
           });
           break;
         }
+        case "question.rejected":
+          context.pendingQuestions.delete(event.properties.requestID);
+          yield* emit({
+            ...(yield* buildEventBase({
+              threadId: context.session.threadId,
+              turnId,
+              requestId: event.properties.requestID,
+              raw: event,
+            })),
+            type: "user-input.resolved",
+            payload: { answers: {} },
+          });
+          break;
         case "session.status": {
           const status = openCodeProviderStatusType(event.properties.status);
           if (status === "busy") {
@@ -1377,57 +1438,90 @@ export function makeOpenCodeAdapter(
       turnId: TurnId | undefined,
       hydrateToolProgress: boolean,
     ) {
-      const messages = yield* runOpenCodeSdk("session.messages", () =>
-        context.client.session.messages({
-          sessionID: child.id,
-        }),
-      ).pipe(
-        Effect.map((response) => response.data ?? []),
-        Effect.catch((cause: OpenCodeRuntimeError) =>
-          Effect.logWarning(
-            `OpenCode child hydration failed for session.messages (${child.id}): ${openCodeRuntimeErrorDetail(cause)}`,
-          ).pipe(Effect.as(undefined)),
-        ),
-      );
+      try {
+        const bufferedEventsAtStart = child.bufferedEvents.splice(0);
+        child.bufferedEventKeys.clear();
+        const preHydrationBufferedEvents = bufferedEventsAtStart.slice(
+          0,
+          child.preLinkBufferedEventCount,
+        );
+        const postHydrationBufferedEvents = bufferedEventsAtStart.slice(
+          child.preLinkBufferedEventCount,
+        );
+        child.preLinkBufferedEventCount = 0;
+        const messages = yield* runOpenCodeSdk("session.messages", () =>
+          context.client.session.messages({
+            sessionID: child.id,
+          }),
+        ).pipe(
+          Effect.map((response) => response.data ?? []),
+          Effect.catch((cause: OpenCodeRuntimeError) =>
+            Effect.logWarning(
+              `OpenCode child hydration failed for session.messages (${child.id}): ${openCodeRuntimeErrorDetail(cause)}`,
+            ).pipe(Effect.as(undefined)),
+          ),
+          Effect.timeout(OPENCODE_CHILD_HYDRATION_TIMEOUT),
+          Effect.catch(() => Effect.succeed(undefined)),
+        );
 
-      let latestToolPart: Extract<Part, { type: "tool" }> | undefined;
-      if (messages !== undefined) {
-        for (const entry of messages) {
-          for (const part of entry.parts) {
-            if (part.type === "tool") {
-              latestToolPart = part;
+        let latestToolPart: Extract<Part, { type: "tool" }> | undefined;
+        if (messages !== undefined) {
+          for (const entry of messages) {
+            for (const part of entry.parts) {
+              if (part.type === "tool") {
+                latestToolPart = part;
+              }
             }
           }
         }
-      }
-      const statusMap = yield* loadChildStatusMap(context, child.id);
-      let statusType: "busy" | "retry" | "idle" | undefined;
-      if (statusMap) {
-        const providerStatus = statusMap[child.id];
-        statusType =
-          providerStatus === undefined ? "idle" : openCodeProviderStatusType(providerStatus);
-      }
+        const statusMap = yield* context.childHydrationSemaphore
+          .withPermit(loadChildStatusMap(context, child.id))
+          .pipe(
+            Effect.timeout(OPENCODE_CHILD_HYDRATION_TIMEOUT),
+            Effect.catch(() => Effect.succeed(undefined)),
+          );
+        let statusType: "busy" | "retry" | "idle" | undefined;
+        if (statusMap) {
+          const providerStatus = statusMap[child.id];
+          statusType =
+            providerStatus === undefined ? "idle" : openCodeProviderStatusType(providerStatus);
+        }
 
-      const bufferedEvents = child.bufferedEvents.splice(0);
-      child.bufferedEventKeys.clear();
-      for (const event of bufferedEvents) {
-        yield* handleChildSubscribedEvent(context, child, event, statusType);
-      }
+        if (statusType === "busy") {
+          yield* emitChildStatus(context, child, "running", turnId);
+        } else if (statusType === "retry") {
+          yield* emitChildStatus(context, child, "waiting", turnId);
+        } else if (statusType === "idle") {
+          yield* emitChildStatus(context, child, "idle", turnId);
+        }
 
-      if (statusType === "busy") {
-        yield* emitChildStatus(context, child, "running", turnId);
-      } else if (statusType === "retry") {
-        yield* emitChildStatus(context, child, "waiting", turnId);
-      } else if (statusType === "idle") {
-        yield* emitChildStatus(context, child, "idle", turnId);
-      }
-      if (
-        hydrateToolProgress &&
-        latestToolPart &&
-        statusType === "busy" &&
-        (latestToolPart.state.status === "pending" || latestToolPart.state.status === "running")
-      ) {
-        yield* emitChildToolProgress(context, child, latestToolPart, turnId);
+        for (const event of preHydrationBufferedEvents) {
+          if (event.type === "session.status" || event.type === "session.idle") {
+            continue;
+          }
+          yield* handleChildSubscribedEvent(context, child, event, statusType);
+        }
+        for (const event of postHydrationBufferedEvents) {
+          yield* handleChildSubscribedEvent(context, child, event, statusType);
+        }
+        while (child.bufferedEvents.length > 0) {
+          const bufferedEvents = child.bufferedEvents.splice(0);
+          child.bufferedEventKeys.clear();
+          for (const event of bufferedEvents) {
+            yield* handleChildSubscribedEvent(context, child, event, statusType);
+          }
+        }
+
+        if (
+          hydrateToolProgress &&
+          latestToolPart &&
+          statusType === "busy" &&
+          (latestToolPart.state.status === "pending" || latestToolPart.state.status === "running")
+        ) {
+          yield* emitChildToolProgress(context, child, latestToolPart, turnId);
+        }
+      } finally {
+        child.hydrating = false;
       }
     });
 
@@ -1438,10 +1532,7 @@ export function makeOpenCodeAdapter(
       turnId: TurnId | undefined,
       raw: unknown,
     ) {
-      if (
-        (yield* Ref.get(context.stopped)) ||
-        link.parentSessionId !== context.openCodeSessionId
-      ) {
+      if ((yield* Ref.get(context.stopped)) || link.parentSessionId !== context.openCodeSessionId) {
         return;
       }
       let child = context.children.get(link.childId);
@@ -1464,6 +1555,8 @@ export function makeOpenCodeAdapter(
           bufferedEvents: [],
           bufferedEventKeys: new Set(),
           seenEventKeys: new Set(),
+          preLinkBufferedEventCount: 0,
+          hydrating: false,
         };
         context.children.set(link.childId, child);
       }
@@ -1481,6 +1574,11 @@ export function makeOpenCodeAdapter(
       child.linked = true;
       child.lastTaskPartId = part.id;
 
+      const shouldHydrate = isNewLink || isNewActivation;
+      if (shouldHydrate) {
+        child.preLinkBufferedEventCount = child.bufferedEvents.length;
+        child.hydrating = true;
+      }
       if (isNewActivation) {
         child.terminalStatus = undefined;
         child.lastStatus = undefined;
@@ -1499,8 +1597,65 @@ export function makeOpenCodeAdapter(
         }
       }
 
-      if ((isNewLink || isNewActivation) && !(yield* Ref.get(context.stopped))) {
-        yield* hydrateChild(context, child, turnId, !isNewActivation);
+      if (shouldHydrate && !(yield* Ref.get(context.stopped))) {
+        if (context.abortingChildIds.has(child.id)) {
+          child.hydrating = false;
+          return;
+        }
+        yield* hydrateChild(context, child, turnId, !isNewActivation).pipe(
+          Effect.forkIn(context.sessionScope),
+          Effect.asVoid,
+        );
+      }
+    });
+
+    const hydrateResumedChildren = Effect.fn("hydrateResumedOpenCodeChildren")(function* (
+      context: OpenCodeSessionContext,
+    ) {
+      const messages = yield* runOpenCodeSdk("session.messages", () =>
+        context.client.session.messages({
+          sessionID: context.openCodeSessionId,
+        }),
+      ).pipe(
+        Effect.map((response) => response.data ?? []),
+        Effect.catch((cause: OpenCodeRuntimeError) =>
+          Effect.logWarning(
+            `OpenCode resumed child hydration failed for session.messages (${context.openCodeSessionId}): ${openCodeRuntimeErrorDetail(cause)}`,
+          ).pipe(Effect.as(undefined)),
+        ),
+        Effect.timeout(OPENCODE_CHILD_HYDRATION_TIMEOUT),
+        Effect.catch(() => Effect.succeed(undefined)),
+      );
+      if (!messages) {
+        return;
+      }
+
+      const latestActiveTaskByChild = new Map<
+        string,
+        { readonly part: Extract<Part, { type: "tool" }>; readonly link: OpenCodeTaskLink }
+      >();
+      for (const entry of messages.slice(-OPENCODE_ROOT_HISTORY_LIMIT)) {
+        for (const part of entry.parts) {
+          if (part.type !== "tool" || part.tool !== "task") {
+            continue;
+          }
+          const link = openCodeTaskLinkFromPart(part);
+          if (
+            !link ||
+            link.parentSessionId !== context.openCodeSessionId ||
+            (part.state.status !== "pending" && part.state.status !== "running")
+          ) {
+            continue;
+          }
+          latestActiveTaskByChild.set(link.childId, { part, link });
+        }
+      }
+
+      for (const { part, link } of latestActiveTaskByChild.values()) {
+        if (yield* Ref.get(context.stopped)) {
+          return;
+        }
+        yield* linkOpenCodeChild(context, part, link, undefined, undefined);
       }
     });
 
@@ -1907,6 +2062,8 @@ export function makeOpenCodeAdapter(
           bufferedEvents: [],
           bufferedEventKeys: new Set(),
           seenEventKeys: new Set(),
+          preLinkBufferedEventCount: 0,
+          hydrating: false,
         };
         context.children.set(payloadSessionId, child);
         context.childStatusMap = undefined;
@@ -1919,7 +2076,7 @@ export function makeOpenCodeAdapter(
       }
 
       yield* writeNative;
-      if (!child.linked) {
+      if (!child.linked || child.hydrating) {
         bufferChildEvent(child, event);
         return;
       }
@@ -2184,6 +2341,8 @@ export function makeOpenCodeAdapter(
             if (!child || !linkage || child.terminalStatus) {
               return;
             }
+            context.childStopPendingIds.delete(childId);
+            context.abortingChildIds.delete(childId);
             child.terminalStatus = "stopped";
             yield* emit({
               ...(yield* buildEventBase({
@@ -2212,6 +2371,8 @@ export function makeOpenCodeAdapter(
           completedAssistantPartIds: new Set(),
           children: new Map(),
           abortingChildIds: new Set(),
+          childStopPendingIds: new Set(),
+          childHydrationSemaphore: yield* Semaphore.make(1),
           childStatusMap: undefined,
           childStatusMapLoaded: false,
           emitChildStopped: () => Effect.void,
@@ -2240,6 +2401,13 @@ export function makeOpenCodeAdapter(
             providerThreadId: started.openCodeSession.id,
           },
         });
+
+        if (resumeSessionId !== undefined) {
+          yield* hydrateResumedChildren(context).pipe(
+            Effect.forkIn(context.sessionScope),
+            Effect.asVoid,
+          );
+        }
 
         return session;
       },
