@@ -1504,16 +1504,35 @@ export function makeOpenCodeAdapter(
           if (event.type === "session.status" || event.type === "session.idle") {
             continue;
           }
-          yield* handleChildSubscribedEvent(context, child, event, statusType);
+          yield* handleChildSubscribedEvent(
+            context,
+            child,
+            event,
+            event.type === "session.error" ||
+              (event.type === "message.updated" && event.properties.info.error)
+              ? undefined
+              : statusType,
+          );
         }
         for (const event of postHydrationBufferedEvents) {
-          yield* handleChildSubscribedEvent(context, child, event, statusType);
+          if (event.type === "session.status" || event.type === "session.idle") {
+            continue;
+          }
+          yield* handleChildSubscribedEvent(
+            context,
+            child,
+            event,
+            event.type === "session.error" ||
+              (event.type === "message.updated" && event.properties.info.error)
+              ? undefined
+              : statusType,
+          );
         }
         while (child.bufferedEvents.length > 0) {
           const bufferedEvents = child.bufferedEvents.splice(0);
           child.bufferedEventKeys.clear();
           for (const event of bufferedEvents) {
-            yield* handleChildSubscribedEvent(context, child, event, statusType);
+            yield* handleChildSubscribedEvent(context, child, event);
           }
         }
 
