@@ -1244,9 +1244,14 @@ export function makeOpenCodeAdapter(
       if (yield* Ref.get(context.stopped)) {
         return;
       }
+      const isStopCompletionEvent =
+        context.childStopPendingIds.has(child.id) &&
+        (event.type === "session.idle" ||
+          (event.type === "session.status" &&
+            openCodeProviderStatusType(event.properties.status) === "idle"));
       if (
         !child.linked ||
-        context.abortingChildIds.has(child.id) ||
+        (context.abortingChildIds.has(child.id) && !isStopCompletionEvent) ||
         !rememberChildEventKey(child, event)
       ) {
         return;
@@ -1630,6 +1635,23 @@ export function makeOpenCodeAdapter(
         return;
       }
 
+      const statusMap = yield* runOpenCodeSdk("session.status", () =>
+        context.client.session.status({ directory: context.directory }),
+      ).pipe(
+        Effect.map((response) => openCodeRecord(response.data)),
+        Effect.catch((cause: OpenCodeRuntimeError) =>
+          Effect.logWarning(
+            `OpenCode resumed child hydration failed for session.status (${context.openCodeSessionId}): ${openCodeRuntimeErrorDetail(cause)}`,
+          ).pipe(Effect.as(undefined)),
+        ),
+        Effect.timeout(OPENCODE_CHILD_HYDRATION_TIMEOUT),
+        Effect.catch(() => Effect.succeed(undefined)),
+      );
+      if (statusMap !== undefined) {
+        context.childStatusMap = statusMap;
+        context.childStatusMapLoaded = true;
+      }
+
       const latestActiveTaskByChild = new Map<
         string,
         { readonly part: Extract<Part, { type: "tool" }>; readonly link: OpenCodeTaskLink }
@@ -1640,14 +1662,24 @@ export function makeOpenCodeAdapter(
             continue;
           }
           const link = openCodeTaskLinkFromPart(part);
-          if (
-            !link ||
-            link.parentSessionId !== context.openCodeSessionId ||
-            (part.state.status !== "pending" && part.state.status !== "running")
-          ) {
+          if (!link || link.parentSessionId !== context.openCodeSessionId) {
             continue;
           }
-          latestActiveTaskByChild.set(link.childId, { part, link });
+          const childId = link.childId;
+          if (typeof childId !== "string") {
+            continue;
+          }
+          const isActiveTask = part.state.status === "pending" || part.state.status === "running";
+          const childStatusType =
+            statusMap === undefined ? undefined : openCodeProviderStatusType(statusMap[childId]);
+          const isActiveBackgroundTask =
+            part.state.status === "completed" &&
+            link.background &&
+            (childStatusType === "busy" || childStatusType === "retry");
+          if (!isActiveTask && !isActiveBackgroundTask) {
+            continue;
+          }
+          latestActiveTaskByChild.set(childId, { part, link });
         }
       }
 
