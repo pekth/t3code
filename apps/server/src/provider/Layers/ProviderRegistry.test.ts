@@ -46,6 +46,11 @@ import {
 } from "./ProviderRegistry.ts";
 import * as ServerConfig from "../../config.ts";
 import * as ServerSettingsModule from "../../serverSettings.ts";
+import {
+  ephemeralProviderEnvSocketPath,
+  makeEphemeralProviderEnvRequest,
+  sendEphemeralProviderEnvRequest,
+} from "../../localIpc/ephemeralProviderEnv.ts";
 import { readProviderStatusCache, resolveProviderStatusCachePath } from "../providerStatusCache.ts";
 import type { ProviderInstance } from "../ProviderDriver.ts";
 import * as ProviderInstanceRegistry from "../Services/ProviderInstanceRegistry.ts";
@@ -1656,6 +1661,130 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             assert.strictEqual(reprobedCodex?.installed, false);
           }).pipe(Effect.provide(runtimeServices));
         }),
+      );
+
+      it.effect(
+        "rebuilds only the selected instance when ephemeral environment is loaded and cleared",
+        () =>
+          Effect.gen(function* () {
+            const serverSettings = yield* makeMutableServerSettingsService(
+              decodeServerSettings(
+                deepMerge(encodedDefaultServerSettings, {
+                  providers: {
+                    codex: { enabled: false },
+                    claudeAgent: { enabled: false },
+                    cursor: { enabled: false },
+                    grok: { enabled: false },
+                    opencode: { enabled: false },
+                  },
+                  providerInstances: {
+                    codex_selected: {
+                      driver: "codex",
+                      enabled: true,
+                      environment: [{ name: "INSTANCE_MARKER", value: "selected" }],
+                      config: { binaryPath: "codex-selected" },
+                    },
+                    codex_unrelated: {
+                      driver: "codex",
+                      enabled: true,
+                      environment: [{ name: "INSTANCE_MARKER", value: "unrelated" }],
+                      config: { binaryPath: "codex-unrelated" },
+                    },
+                  } as unknown as ContractServerSettings["providerInstances"],
+                }),
+              ),
+            );
+            const spawner = recordingMockSpawnerLayer(() => ({
+              stdout: "codex-cli 1.0.0\n",
+              stderr: "",
+              code: 0,
+            }));
+            const scope = yield* Scope.make();
+            yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+            const runtimeServices = yield* Layer.build(
+              ProviderRegistryLive.pipe(
+                Layer.provideMerge(ProviderInstanceRegistryHydrationLive),
+                Layer.provideMerge(
+                  Layer.succeed(ServerSettingsModule.ServerSettingsService, serverSettings),
+                ),
+                Layer.provideMerge(
+                  ServerConfig.layerTest(process.cwd(), {
+                    prefix: "pe-",
+                  }),
+                ),
+                Layer.provideMerge(TestHttpClientLive),
+                Layer.provideMerge(
+                  Layer.succeed(
+                    ProviderEventLoggers.ProviderEventLoggers,
+                    ProviderEventLoggers.NoOpProviderEventLoggers,
+                  ),
+                ),
+                Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
+                Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
+                Layer.provideMerge(spawner.layer),
+                Layer.provideMerge(NodeServices.layer),
+              ),
+            ).pipe(Scope.provide(scope));
+
+            yield* Effect.gen(function* () {
+              const registry = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
+              const config = yield* ServerConfig.ServerConfig;
+              const selectedId = ProviderInstanceId.make("codex_selected");
+              const unrelatedId = ProviderInstanceId.make("codex_unrelated");
+              const selectedBefore = yield* registry.getInstance(selectedId);
+              const unrelatedBefore = yield* registry.getInstance(unrelatedId);
+
+              yield* Effect.tryPromise(() =>
+                sendEphemeralProviderEnvRequest({
+                  socketPath: ephemeralProviderEnvSocketPath(config.stateDir),
+                  request: makeEphemeralProviderEnvRequest({
+                    operation: "load",
+                    instanceId: selectedId,
+                    value: "runtime-only",
+                  }),
+                }),
+              ).pipe(Effect.orDie);
+
+              const selectedLoaded = yield* registry.getInstance(selectedId);
+              const unrelatedLoaded = yield* registry.getInstance(unrelatedId);
+              assert.notStrictEqual(selectedLoaded, selectedBefore);
+              assert.strictEqual(unrelatedLoaded, unrelatedBefore);
+
+              assert.ok(
+                spawner.commands.some(
+                  (command) =>
+                    command.env?.INSTANCE_MARKER === "selected" &&
+                    command.env.BW_SESSION === "runtime-only",
+                ),
+              );
+
+              const commandCountBeforeClear = spawner.commands.length;
+              yield* Effect.tryPromise(() =>
+                sendEphemeralProviderEnvRequest({
+                  socketPath: ephemeralProviderEnvSocketPath(config.stateDir),
+                  request: makeEphemeralProviderEnvRequest({
+                    operation: "clear",
+                    instanceId: selectedId,
+                  }),
+                }),
+              ).pipe(Effect.orDie);
+
+              const selectedCleared = yield* registry.getInstance(selectedId);
+              const unrelatedCleared = yield* registry.getInstance(unrelatedId);
+              assert.notStrictEqual(selectedCleared, selectedLoaded);
+              assert.strictEqual(unrelatedCleared, unrelatedBefore);
+
+              assert.ok(
+                spawner.commands
+                  .slice(commandCountBeforeClear)
+                  .some(
+                    (command) =>
+                      command.env?.INSTANCE_MARKER === "selected" &&
+                      command.env.BW_SESSION === undefined,
+                  ),
+              );
+            }).pipe(Effect.provide(runtimeServices));
+          }),
       );
 
       it.effect("includes unavailable instance snapshots in getProviders", () =>

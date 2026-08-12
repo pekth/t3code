@@ -43,6 +43,7 @@
  */
 import {
   defaultInstanceIdForDriver,
+  ProviderInstanceId,
   type ProviderInstanceConfig,
   type ProviderInstanceConfigMap,
   ServerSettings,
@@ -51,10 +52,14 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 
+import { ServerConfig } from "../../config.ts";
+import { startEphemeralProviderEnvIpcServer } from "../../localIpc/ephemeralProviderEnv.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { BUILT_IN_DRIVERS, type BuiltInDriversEnv } from "../builtInDrivers.ts";
+import { ProviderEnvironmentOverlay } from "../Services/ProviderEnvironmentOverlay.ts";
 import { ProviderInstanceRegistry } from "../Services/ProviderInstanceRegistry.ts";
 import { ProviderInstanceRegistryMutator } from "../Services/ProviderInstanceRegistryMutator.ts";
+import { layer as ProviderEnvironmentOverlayLive } from "./ProviderEnvironmentOverlay.ts";
 import { ProviderInstanceRegistryMutableLayer } from "./ProviderInstanceRegistryLive.ts";
 
 /**
@@ -103,6 +108,46 @@ export const deriveProviderInstanceConfigMap = (
   return merged as ProviderInstanceConfigMap;
 };
 
+const deriveProviderInstanceConfigMapWithOverlay = Effect.fn(
+  "ProviderInstanceRegistryHydration.deriveProviderInstanceConfigMapWithOverlay",
+)(function* (settings: ServerSettings) {
+  const overlay = yield* ProviderEnvironmentOverlay;
+  const configured = deriveProviderInstanceConfigMap(settings);
+  const resolved: Record<string, ProviderInstanceConfig> = {};
+
+  for (const [instanceId, entry] of Object.entries(configured)) {
+    const environment = yield* overlay.resolve(
+      ProviderInstanceId.make(instanceId),
+      entry.environment ?? [],
+    );
+    resolved[instanceId] =
+      environment === entry.environment ||
+      (entry.environment === undefined && environment.length === 0)
+        ? entry
+        : { ...entry, environment };
+  }
+
+  return resolved as ProviderInstanceConfigMap;
+});
+
+const reconcileProviderInstanceEnvironment = Effect.fn(
+  "ProviderInstanceRegistryHydration.reconcileProviderInstanceEnvironment",
+)(function* (instanceId: ProviderInstanceId) {
+  const serverSettings = yield* ServerSettingsService;
+  const mutator = yield* ProviderInstanceRegistryMutator;
+  const overlay = yield* ProviderEnvironmentOverlay;
+  const settings = yield* serverSettings.getSettings;
+  const configured = deriveProviderInstanceConfigMap(settings);
+  const entry = configured[instanceId];
+  if (entry === undefined) return;
+  const environment = yield* overlay.resolve(instanceId, entry.environment ?? []);
+  const configMap = {
+    ...configured,
+    [instanceId]: { ...entry, environment },
+  } as ProviderInstanceConfigMap;
+  yield* mutator.reconcile(configMap);
+});
+
 /**
  * Layer that consumes `ProviderInstanceRegistryMutator` and forks a
  * settings-watcher fiber. The fiber's lifetime is tied to the enclosing
@@ -120,15 +165,69 @@ const SettingsWatcherLive = Layer.effectDiscard(
     const serverSettings = yield* ServerSettingsService;
     yield* serverSettings.streamChanges.pipe(
       Stream.runForEach((next) =>
-        mutator
-          .reconcile(deriveProviderInstanceConfigMap(next))
-          .pipe(
-            Effect.catchCause((cause) =>
-              Effect.logError("ProviderInstanceRegistry reconcile failed", cause),
-            ),
+        deriveProviderInstanceConfigMapWithOverlay(next).pipe(
+          Effect.flatMap((configMap) => mutator.reconcile(configMap)),
+          Effect.catchCause((cause) =>
+            Effect.logError("ProviderInstanceRegistry reconcile failed", cause),
           ),
+        ),
       ),
       Effect.forkScoped,
+    );
+  }),
+);
+
+const EphemeralProviderEnvironmentIpcLive = Layer.effectDiscard(
+  Effect.gen(function* () {
+    if (process.platform === "win32") return;
+
+    const config = yield* ServerConfig;
+    const registry = yield* ProviderInstanceRegistry;
+    const overlay = yield* ProviderEnvironmentOverlay;
+    const handlerContext = yield* Effect.context<
+      ServerSettingsService | ProviderInstanceRegistryMutator | ProviderEnvironmentOverlay
+    >();
+
+    yield* Effect.acquireRelease(
+      Effect.tryPromise({
+        try: () =>
+          startEphemeralProviderEnvIpcServer({
+            stateDir: config.stateDir,
+            handler: {
+              hasProviderInstance: (instanceId) =>
+                Effect.runPromise(
+                  registry
+                    .getInstance(instanceId)
+                    .pipe(Effect.map((instance) => instance !== undefined)),
+                ),
+              load: (input) =>
+                Effect.runPromise(
+                  overlay
+                    .load(input)
+                    .pipe(
+                      Effect.andThen(reconcileProviderInstanceEnvironment(input.instanceId)),
+                      Effect.provideContext(handlerContext),
+                    ),
+                ),
+              clear: (instanceId) =>
+                Effect.runPromise(
+                  overlay
+                    .clear(instanceId)
+                    .pipe(
+                      Effect.andThen(reconcileProviderInstanceEnvironment(instanceId)),
+                      Effect.provideContext(handlerContext),
+                    ),
+                ),
+            },
+          }),
+        catch: (cause) => cause,
+      }).pipe(Effect.orDie),
+      (server) =>
+        Effect.promise(() => server.close()).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("Failed to close ephemeral provider environment IPC", { cause }),
+          ),
+        ),
     );
   }),
 );
@@ -152,7 +251,7 @@ const SettingsWatcherLive = Layer.effectDiscard(
 export const ProviderInstanceRegistryHydrationLive: Layer.Layer<
   ProviderInstanceRegistry,
   never,
-  BuiltInDriversEnv | ServerSettingsService
+  BuiltInDriversEnv | ServerSettingsService | ServerConfig
 > = Layer.unwrap(
   Effect.gen(function* () {
     const serverSettings = yield* ServerSettingsService;
@@ -162,13 +261,19 @@ export const ProviderInstanceRegistryHydrationLive: Layer.Layer<
     const initialConfigMap =
       initialSettings === undefined
         ? ({} as ProviderInstanceConfigMap)
-        : deriveProviderInstanceConfigMap(initialSettings);
+        : yield* deriveProviderInstanceConfigMapWithOverlay(initialSettings);
 
     const mutableLayer = ProviderInstanceRegistryMutableLayer({
       drivers: BUILT_IN_DRIVERS,
       configMap: initialConfigMap,
     });
 
-    return SettingsWatcherLive.pipe(Layer.provideMerge(mutableLayer));
+    return Layer.merge(SettingsWatcherLive, EphemeralProviderEnvironmentIpcLive).pipe(
+      Layer.provideMerge(mutableLayer),
+    );
   }),
-) as Layer.Layer<ProviderInstanceRegistry, never, BuiltInDriversEnv | ServerSettingsService>;
+).pipe(Layer.provide(ProviderEnvironmentOverlayLive)) as Layer.Layer<
+  ProviderInstanceRegistry,
+  never,
+  BuiltInDriversEnv | ServerSettingsService | ServerConfig
+>;

@@ -215,6 +215,16 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
     }),
   );
 
+  it.effect("exposes local in-memory BW_SESSION commands", () =>
+    Effect.gen(function* () {
+      const { output } = yield* captureStdout(runCli(["provider-env", "--help"], noConnectCli));
+
+      assert.include(output, "Manage in-memory BW_SESSION values on the local server.");
+      assert.include(output, "load");
+      assert.include(output, "clear");
+    }),
+  );
+
   it.effect("reports fresh headless connect state without requiring local configuration", () =>
     Effect.gen(function* () {
       const baseDir = NodeFS.mkdtempSync(
