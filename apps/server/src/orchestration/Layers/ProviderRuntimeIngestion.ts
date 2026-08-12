@@ -1343,16 +1343,24 @@ const make = Effect.gen(function* () {
             return true;
           case "turn.started":
             return !conflictsWithActiveTurn || conflictingTurnStartIsPendingTurnStart;
+          case "session.state.changed":
+            // A late state notification for another turn must not clear the
+            // active turn. Providers may omit turnId for valid session state
+            // transitions, so only reject an explicit conflicting id.
+            return !conflictsWithActiveTurn;
           case "turn.completed":
+            // A completion can close lifecycle state only for a known active
+            // turn. An event received after the turn is already settled, or
+            // without a turn id, is still safe to process for message cleanup
+            // below but must not make the thread look ready again.
+            if (activeTurnId === null || eventTurnId === undefined) {
+              return false;
+            }
             if (conflictsWithActiveTurn || missingTurnForActiveTurn) {
               return false;
             }
             // Only the active turn may close the lifecycle state.
-            if (activeTurnId !== null && eventTurnId !== undefined) {
-              return sameId(activeTurnId, eventTurnId);
-            }
-            // If no active turn is tracked, accept completion scoped to this thread.
-            return true;
+            return sameId(activeTurnId, eventTurnId);
           default:
             return true;
         }

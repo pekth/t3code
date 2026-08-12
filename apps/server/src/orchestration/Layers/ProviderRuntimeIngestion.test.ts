@@ -820,6 +820,11 @@ describe("ProviderRuntimeIngestion", () => {
     const midThread = midReadModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
     expect(midThread?.session?.status).toBe("running");
     expect(midThread?.session?.activeTurnId).toBe("turn-primary");
+    // A late completion from an older provider turn must not make the thread
+    // look idle. The lifecycle guard must preserve both the active turn and
+    // the running session until the current turn settles.
+    expect(midThread?.latestTurn?.turnId).toBe("turn-primary");
+    expect(midThread?.latestTurn?.state).toBe("running");
 
     harness.emit({
       type: "turn.completed",
@@ -835,6 +840,61 @@ describe("ProviderRuntimeIngestion", () => {
       harness.readModel,
       (thread) => thread.session?.status === "ready" && thread.session?.activeTurnId === null,
     );
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-turn-completed-after-settle"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: "2026-01-01T00:00:01.000Z",
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-late"),
+      status: "completed",
+    });
+
+    await harness.drain();
+    const afterLateReadModel = await harness.readModel();
+    const afterLateThread = afterLateReadModel.threads.find(
+      (entry) => entry.id === ThreadId.make("thread-1"),
+    );
+    expect(afterLateThread?.session?.status).toBe("ready");
+    expect(afterLateThread?.session?.activeTurnId).toBeNull();
+  });
+
+  it("ignores a late ready state for a different active turn", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-state-guard"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-state-guard-main"),
+    });
+
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "running" &&
+        thread.session?.activeTurnId === "turn-state-guard-main",
+    );
+
+    harness.emit({
+      type: "session.state.changed",
+      eventId: asEventId("evt-session-ready-state-guard-late"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: "2026-01-01T00:00:01.000Z",
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-state-guard-old"),
+      payload: { state: "ready" },
+    });
+
+    await harness.drain();
+    const thread = (await harness.readModel()).threads.find(
+      (entry) => entry.id === ThreadId.make("thread-1"),
+    );
+    expect(thread?.session?.status).toBe("running");
+    expect(thread?.session?.activeTurnId).toBe("turn-state-guard-main");
   });
 
   it("ignores non-active turn completion when runtime omits thread id", async () => {
