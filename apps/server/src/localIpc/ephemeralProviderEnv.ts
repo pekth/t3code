@@ -1,4 +1,5 @@
-// @effect-diagnostics nodeBuiltinImport:off - Local IPC intentionally uses owner-only Unix sockets.
+// @effect-diagnostics nodeBuiltinImport:off - Local IPC uses owner-only Unix sockets or Windows named pipes.
+import { createHash } from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodeNet from "node:net";
 import * as NodePath from "node:path";
@@ -8,6 +9,8 @@ import * as Schema from "effect/Schema";
 
 export const EPHEMERAL_PROVIDER_ENV_SOCKET_NAME = "provider-env.sock";
 export const EPHEMERAL_PROVIDER_ENV_MAX_VALUE_BYTES = 64 * 1024;
+const WINDOWS_NAMED_PIPE_PREFIX = "\\\\.\\pipe\\";
+const WINDOWS_NAMED_PIPE_NAME = /^\\\\\.\\pipe\\t3-provider-env-[a-f0-9]{32}$/;
 const MAX_REQUEST_BYTES = EPHEMERAL_PROVIDER_ENV_MAX_VALUE_BYTES + 1024;
 
 export type EphemeralProviderEnvRequest =
@@ -42,7 +45,6 @@ export type EphemeralProviderEnvResponse =
 export class EphemeralProviderEnvIpcError extends Error {
   constructor(
     readonly code:
-      | "unsupported_platform"
       | "invalid_request"
       | "socket_unavailable"
       | "socket_insecure"
@@ -51,10 +53,9 @@ export class EphemeralProviderEnvIpcError extends Error {
   ) {
     super(
       {
-        unsupported_platform: "Ephemeral provider environment IPC is not supported on Windows.",
         invalid_request: "Invalid Bitwarden session request.",
-        socket_unavailable: "The local T3 server Bitwarden session socket is unavailable.",
-        socket_insecure: "The local T3 server Bitwarden session socket is not owner-only.",
+        socket_unavailable: "The local T3 server Bitwarden session endpoint is unavailable.",
+        socket_insecure: "The local T3 server Bitwarden session endpoint is not trusted.",
         provider_instance_not_found: "The selected provider instance is not configured.",
         mutation_failed: "The running T3 server could not update the Bitwarden session.",
       }[code],
@@ -65,8 +66,27 @@ export class EphemeralProviderEnvIpcError extends Error {
 
 const decodeProviderInstanceId = Schema.decodeUnknownSync(ProviderInstanceId);
 
-export function ephemeralProviderEnvSocketPath(stateDir: string): string {
+function windowsNamedPipePath(stateDir: string): string {
+  // The server and the CLI can receive the same Windows path with different
+  // casing or slash styles. Normalize before hashing so both processes select
+  // the same pipe. Keep a filesystem root's trailing separator intact.
+  const normalized = NodePath.win32.normalize(stateDir).toLowerCase();
+  const root = NodePath.win32.parse(normalized).root;
+  const canonical = normalized === root ? normalized : normalized.replace(/[\\]+$/, "");
+  const stateHash = createHash("sha256").update(canonical).digest("hex").slice(0, 32);
+  return `${WINDOWS_NAMED_PIPE_PREFIX}t3-provider-env-${stateHash}`;
+}
+
+export function ephemeralProviderEnvSocketPath(
+  stateDir: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  if (platform === "win32") return windowsNamedPipePath(stateDir);
   return NodePath.join(stateDir, EPHEMERAL_PROVIDER_ENV_SOCKET_NAME);
+}
+
+export function isEphemeralProviderEnvNamedPipePath(socketPath: string): boolean {
+  return WINDOWS_NAMED_PIPE_NAME.test(socketPath);
 }
 
 export function makeEphemeralProviderEnvRequest(input: {
@@ -140,22 +160,22 @@ export async function startEphemeralProviderEnvIpcServer(input: {
   readonly stateDir: string;
   readonly handler: EphemeralProviderEnvHandler;
 }): Promise<{ readonly socketPath: string; readonly close: () => Promise<void> }> {
-  if (process.platform === "win32") {
-    throw new EphemeralProviderEnvIpcError("unsupported_platform");
-  }
+  const isWindows = process.platform === "win32";
   const socketPath = ephemeralProviderEnvSocketPath(input.stateDir);
-  NodeFS.mkdirSync(input.stateDir, { recursive: true, mode: 0o700 });
-  try {
-    const stale = NodeFS.lstatSync(socketPath);
-    if (
-      !stale.isSocket() ||
-      (typeof process.getuid === "function" && stale.uid !== process.getuid())
-    ) {
-      throw new EphemeralProviderEnvIpcError("socket_insecure");
+  if (!isWindows) {
+    NodeFS.mkdirSync(input.stateDir, { recursive: true, mode: 0o700 });
+    try {
+      const stale = NodeFS.lstatSync(socketPath);
+      if (
+        !stale.isSocket() ||
+        (typeof process.getuid === "function" && stale.uid !== process.getuid())
+      ) {
+        throw new EphemeralProviderEnvIpcError("socket_insecure");
+      }
+      NodeFS.unlinkSync(socketPath);
+    } catch (cause) {
+      if (!(cause instanceof Error && "code" in cause && cause.code === "ENOENT")) throw cause;
     }
-    NodeFS.unlinkSync(socketPath);
-  } catch (cause) {
-    if (!(cause instanceof Error && "code" in cause && cause.code === "ENOENT")) throw cause;
   }
 
   const server = NodeNet.createServer((socket) => {
@@ -198,7 +218,7 @@ export async function startEphemeralProviderEnvIpcServer(input: {
       resolve();
     });
   });
-  NodeFS.chmodSync(socketPath, 0o600);
+  if (!isWindows) NodeFS.chmodSync(socketPath, 0o600);
 
   return {
     socketPath,
@@ -206,10 +226,12 @@ export async function startEphemeralProviderEnvIpcServer(input: {
       await new Promise<void>((resolve, reject) =>
         server.close((error) => (error ? reject(error) : resolve())),
       );
-      try {
-        NodeFS.unlinkSync(socketPath);
-      } catch (cause) {
-        if (!(cause instanceof Error && "code" in cause && cause.code === "ENOENT")) throw cause;
+      if (!isWindows) {
+        try {
+          NodeFS.unlinkSync(socketPath);
+        } catch (cause) {
+          if (!(cause instanceof Error && "code" in cause && cause.code === "ENOENT")) throw cause;
+        }
       }
     },
   };
@@ -228,14 +250,24 @@ function assertSecureSocket(socketPath: string): void {
   }
 }
 
+function assertSecureEndpoint(socketPath: string): void {
+  if (process.platform === "win32") {
+    // Node/libuv creates named pipes with the current process token's default
+    // DACL. Restrict the client to our derived endpoint shape so callers cannot
+    // redirect a session value to an arbitrary named pipe.
+    if (!isEphemeralProviderEnvNamedPipePath(socketPath)) {
+      throw new EphemeralProviderEnvIpcError("socket_insecure");
+    }
+    return;
+  }
+  assertSecureSocket(socketPath);
+}
+
 export async function sendEphemeralProviderEnvRequest(input: {
   readonly socketPath: string;
   readonly request: EphemeralProviderEnvRequest;
 }): Promise<void> {
-  if (process.platform === "win32") {
-    throw new EphemeralProviderEnvIpcError("unsupported_platform");
-  }
-  assertSecureSocket(input.socketPath);
+  assertSecureEndpoint(input.socketPath);
   const response = await new Promise<EphemeralProviderEnvResponse>((resolve, reject) => {
     const socket = NodeNet.createConnection(input.socketPath);
     let raw = "";

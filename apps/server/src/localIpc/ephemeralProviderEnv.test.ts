@@ -1,4 +1,4 @@
-// @effect-diagnostics nodeBuiltinImport:off - Tests exercise the Unix socket security boundary.
+// @effect-diagnostics nodeBuiltinImport:off - Tests exercise local IPC security boundaries.
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -9,6 +9,8 @@ import { afterEach, assert, describe, expect, it } from "vitest";
 import {
   EPHEMERAL_PROVIDER_ENV_MAX_VALUE_BYTES,
   EphemeralProviderEnvIpcError,
+  ephemeralProviderEnvSocketPath,
+  isEphemeralProviderEnvNamedPipePath,
   makeEphemeralProviderEnvRequest,
   sendEphemeralProviderEnvRequest,
   startEphemeralProviderEnvIpcServer,
@@ -20,7 +22,24 @@ afterEach(async () => {
   while (cleanups.length > 0) await cleanups.pop()?.();
 });
 
-describe.skipIf(process.platform === "win32")("ephemeral provider environment IPC", () => {
+describe("ephemeral provider environment IPC", () => {
+  it("derives a platform-specific local endpoint", () => {
+    const stateDir = "/private/t3-provider-env-test";
+    const posixPath = ephemeralProviderEnvSocketPath(stateDir, "darwin");
+    const windowsPath = ephemeralProviderEnvSocketPath(stateDir, "win32");
+
+    assert.equal(posixPath, NodePath.join(stateDir, "provider-env.sock"));
+    assert.equal(isEphemeralProviderEnvNamedPipePath(windowsPath), true);
+    assert.equal(isEphemeralProviderEnvNamedPipePath(posixPath), false);
+  });
+
+  it("keeps the Windows endpoint stable across path spelling", () => {
+    const upperCase = ephemeralProviderEnvSocketPath("C:\\Users\\PB\\.T3\\userdata", "win32");
+    const mixedSeparators = ephemeralProviderEnvSocketPath("c:/users/pb/.t3/userdata/", "win32");
+
+    assert.equal(upperCase, mixedSeparators);
+  });
+
   it("loads and clears a value through an owner-only socket", async () => {
     const stateDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-provider-env-"));
     const mutations: Array<{ operation: string; value?: string }> = [];
@@ -28,13 +47,21 @@ describe.skipIf(process.platform === "win32")("ephemeral provider environment IP
       stateDir,
       handler: {
         hasProviderInstance: (instanceId) => instanceId === "codex_work",
-        load: ({ value }) => mutations.push({ operation: "load", value }),
-        clear: () => mutations.push({ operation: "clear" }),
+        load: ({ value }) => {
+          mutations.push({ operation: "load", value });
+        },
+        clear: () => {
+          mutations.push({ operation: "clear" });
+        },
       },
     });
     cleanups.push(server.close);
 
-    assert.equal(NodeFS.statSync(server.socketPath).mode & 0o777, 0o600);
+    if (process.platform === "win32") {
+      assert.equal(isEphemeralProviderEnvNamedPipePath(server.socketPath), true);
+    } else {
+      assert.equal(NodeFS.statSync(server.socketPath).mode & 0o777, 0o600);
+    }
     await sendEphemeralProviderEnvRequest({
       socketPath: server.socketPath,
       request: makeEphemeralProviderEnvRequest({
@@ -111,6 +138,8 @@ describe.skipIf(process.platform === "win32")("ephemeral provider environment IP
   });
 
   it("refuses a socket with group or other permissions", async () => {
+    if (process.platform === "win32") return;
+
     const stateDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-provider-env-"));
     const server = await startEphemeralProviderEnvIpcServer({
       stateDir,

@@ -1,13 +1,13 @@
 /**
- * ProviderInstanceRegistryHydration — derive a `ProviderInstanceConfigMap`
+ * ProviderInstanceRegistryHydration - derive a `ProviderInstanceConfigMap`
  * from `ServerSettings` and keep `ProviderInstanceRegistry` in sync with it.
  *
  * The server still reads two shapes:
  *
- *   1. `settings.providerInstances` — the new driver-agnostic map the
+ *   1. `settings.providerInstances` - the new driver-agnostic map the
  *      registry expects. Keyed by `ProviderInstanceId`, values are
  *      `ProviderInstanceConfig` envelopes.
- *   2. `settings.providers.<kind>` — the legacy single-instance-per-driver
+ *   2. `settings.providers.<kind>` - the legacy single-instance-per-driver
  *      fields (`providers.codex`, `providers.claudeAgent`, …). These are
  *      the source of truth for every deployment that hasn't been migrated
  *      yet to an explicit `providerInstances` entry.
@@ -15,12 +15,12 @@
  * This module bridges (2) into (1) and wires the resulting map into a
  * mutable registry. For every built-in driver whose id is not already
  * present in `providerInstances` (keyed on
- * `defaultInstanceIdForDriver(driverKind)` — literally the driver kind as a
+ * `defaultInstanceIdForDriver(driverKind)` - literally the driver kind as a
  * routing slug), we synthesize an envelope from the legacy field. The
  * registry decodes both flavours through the same `configSchema` and ends
  * up with one uniform `ProviderInstance` per entry.
  *
- * Explicit `providerInstances` entries always win — users can already
+ * Explicit `providerInstances` entries always win - users can already
  * override the legacy `providers.<kind>` blob by authoring a
  * `providerInstances.codex` entry with a matching driver, and we don't
  * want the synthesized envelope to silently stomp their config.
@@ -83,7 +83,7 @@ export const deriveProviderInstanceConfigMap = (
   for (const driver of BUILT_IN_DRIVERS) {
     const instanceId = defaultInstanceIdForDriver(driver.driverKind);
     if (instanceId in merged) {
-      // Explicit `providerInstances` entry for this slot — user-authored
+      // Explicit `providerInstances` entry for this slot - user-authored
       // config always wins over the legacy mirror.
       continue;
     }
@@ -154,7 +154,7 @@ const reconcileProviderInstanceEnvironment = Effect.fn(
  * layer scope (process lifetime in production), so it is interrupted on
  * shutdown without leaking.
  *
- * Errors inside the watcher are logged and swallowed — the registry's own
+ * Errors inside the watcher are logged and swallowed - the registry's own
  * "unavailable" bucket already absorbs unknown drivers and invalid
  * configs, so the only way the watcher could fail is a settings stream
  * tear-down, which logs and exits cleanly.
@@ -179,8 +179,6 @@ const SettingsWatcherLive = Layer.effectDiscard(
 
 const EphemeralProviderEnvironmentIpcLive = Layer.effectDiscard(
   Effect.gen(function* () {
-    if (process.platform === "win32") return;
-
     const config = yield* ServerConfig;
     const registry = yield* ProviderInstanceRegistry;
     const overlay = yield* ProviderEnvironmentOverlay;
