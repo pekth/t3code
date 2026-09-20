@@ -626,12 +626,16 @@ function acpMcpContext(threadId: ThreadId | null): AcpMcpContext {
   // The agent spawns the bridge from its own working directory, so the server
   // entrypoint must be an absolute path.
   const serverEntrypoint = process.argv[1] === undefined ? "t3" : NodePath.resolve(process.argv[1]);
+  const bridgeArgs =
+    NodePath.resolve(process.execPath) === serverEntrypoint
+      ? ["acp-mcp-bridge"]
+      : [serverEntrypoint, "acp-mcp-bridge"];
   return {
     servers: [
       {
         name: "t3-code",
         command: process.execPath,
-        args: [serverEntrypoint, "acp-mcp-bridge"],
+        args: bridgeArgs,
         env: [
           { name: "ELECTRON_RUN_AS_NODE", value: "1" },
           { name: "T3_ACP_MCP_ENDPOINT", value: session.endpoint },
