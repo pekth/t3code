@@ -473,23 +473,102 @@ export const layer: Layer.Layer<
       const existingSessionProjection = projection.providerSessions.find(
         (candidate) => candidate.id === providerSessionId,
       );
-      const session = yield* providerSessions.open({
-        threadId: projection.thread.id,
-        providerSessionId,
-        modelSelection: run.modelSelection,
-        runtimePolicy: resolvedRuntimePolicy,
-        ...(existingSessionProjection === undefined
-          ? {}
-          : { resumeFromSession: existingSessionProjection }),
-        ...(providerThread.nativeThreadRef?.nativeId == null
-          ? {}
-          : { initialNativeThreadId: providerThread.nativeThreadRef.nativeId }),
-        ...(providerThread.nativeMetadata?.itemIdentityVersion === undefined
-          ? {}
-          : {
-              initialProviderItemIdentityVersion: providerThread.nativeMetadata.itemIdentityVersion,
-            }),
-      });
+      const sessionResult = yield* Effect.result(
+        providerSessions.open({
+          threadId: projection.thread.id,
+          providerSessionId,
+          modelSelection: run.modelSelection,
+          runtimePolicy: resolvedRuntimePolicy,
+          ...(existingSessionProjection === undefined
+            ? {}
+            : { resumeFromSession: existingSessionProjection }),
+          ...(providerThread.nativeThreadRef?.nativeId == null
+            ? {}
+            : { initialNativeThreadId: providerThread.nativeThreadRef.nativeId }),
+          ...(providerThread.nativeMetadata?.itemIdentityVersion === undefined
+            ? {}
+            : {
+                initialProviderItemIdentityVersion:
+                  providerThread.nativeMetadata.itemIdentityVersion,
+              }),
+        }),
+      );
+      if (sessionResult._tag === "Failure") {
+        const failedAt = yield* DateTime.now;
+        const openError = sessionResult.failure;
+        const nestedCause = "cause" in openError ? openError.cause : undefined;
+        const failure = makeProviderFailure({
+          cause: openError,
+          message:
+            nestedCause instanceof Error
+              ? nestedCause.message
+              : typeof nestedCause === "string"
+                ? nestedCause
+                : openError.message,
+          class: "provider_error",
+        });
+        const item: OrchestrationV2TurnItem = {
+          id: idAllocator.derive.runSignalTurnItem({
+            runId,
+            signal: "provider-session-open-failure",
+          }),
+          threadId: projection.thread.id,
+          runId,
+          nodeId: rootNode.id,
+          providerThreadId: providerThread.id,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal:
+            Math.max(
+              0,
+              ...projection.turnItems
+                .filter((item) => item.runId === runId)
+                .map((item) => item.ordinal),
+            ) + 1,
+          status: "failed",
+          startedAt: failedAt,
+          completedAt: failedAt,
+          updatedAt: failedAt,
+          type: "error",
+          title: "Provider session failed to open",
+          failure,
+        };
+        const eventPayloads = [
+          { type: "turn-item.updated", payload: item },
+          { type: "run.updated", payload: { ...run, status: "failed", completedAt: failedAt } },
+          {
+            type: "run-attempt.updated",
+            payload: { ...attempt, status: "failed", completedAt: failedAt },
+          },
+          {
+            type: "node.updated",
+            payload: { ...rootNode, status: "failed", completedAt: failedAt },
+          },
+        ] as const;
+        const events = yield* Effect.forEach(eventPayloads, (event) =>
+          Effect.gen(function* () {
+            return {
+              ...event,
+              id: yield* idAllocator.allocate.event({ threadId: projection.thread.id }),
+              threadId: projection.thread.id,
+              runId,
+              nodeId: rootNode.id,
+              providerInstanceId: run.providerInstanceId,
+              occurredAt: failedAt,
+            } satisfies OrchestrationV2DomainEvent;
+          }),
+        );
+        yield* eventSink.writeIfRunCurrent({
+          threadId: projection.thread.id,
+          runId,
+          activeAttemptId: attempt.id,
+          expectedStatus: "starting",
+          events,
+        });
+        return;
+      }
+      const session = sessionResult.success;
       let effectiveHandoffs = handoffs;
       const loadedProviderThread = yield* Effect.gen(function* () {
         if (nativeForkTransfer !== undefined) {
