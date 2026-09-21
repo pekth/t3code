@@ -7,9 +7,11 @@ import {
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
+import * as NodeSea from "node:sea";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
+import { vi } from "vite-plus/test";
 import {
   CheckpointId,
   GrokSettings,
@@ -90,6 +92,11 @@ import {
 } from "./AcpAdapterV2.ts";
 
 import { makeGrokAdapterV2 } from "./GrokAdapterV2.ts";
+
+vi.mock("node:sea", async (importOriginal) => {
+  const sea = await importOriginal<typeof import("node:sea")>();
+  return { ...sea, isSea: vi.fn(sea.isSea) };
+});
 
 const DEFAULT_GROK_SETTINGS = Schema.decodeSync(GrokSettings)({});
 
@@ -568,8 +575,7 @@ describe("AcpAdapterV2", () => {
       const mockAgentPath = yield* path.fromFileUrl(
         new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
       );
-      const originalEntrypoint = process.argv[1];
-      process.argv[1] = process.execPath;
+      vi.mocked(NodeSea.isSea).mockReturnValue(true);
 
       const instanceId = ProviderInstanceId.make("acp-test-self-contained-mcp-bridge");
       const threadId = ThreadId.make("thread-acp-self-contained-mcp-bridge");
@@ -585,8 +591,7 @@ describe("AcpAdapterV2", () => {
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
           McpProviderSession.clearMcpProviderSession(threadId);
-          if (originalEntrypoint === undefined) process.argv.splice(1, 1);
-          else process.argv[1] = originalEntrypoint;
+          vi.mocked(NodeSea.isSea).mockReset();
         }),
       );
 
@@ -626,6 +631,8 @@ describe("AcpAdapterV2", () => {
       }
       assert.equal(mcpServer.command, process.execPath);
       assert.deepEqual(mcpServer.args, ["acp-mcp-bridge"]);
+      assert.equal(runtimeInput?.processEnvironment?.T3_ACP_MCP_NODE, process.execPath);
+      assert.equal(runtimeInput?.processEnvironment?.T3_ACP_MCP_ENTRYPOINT, undefined);
     }).pipe(Effect.provide(testLayer), Effect.scoped),
   );
 
