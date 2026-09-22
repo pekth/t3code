@@ -4050,15 +4050,15 @@ describe("ProviderCommandReactor", () => {
     });
   });
 
-  it("normalizes stale Codex approval callbacks without faking approval resolution", async () => {
+  it("normalizes stale Antigravity approval callbacks without faking approval resolution", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";
     harness.respondToRequest.mockImplementation(() =>
       Effect.fail(
         new ProviderAdapterRequestError({
-          provider: ProviderDriverKind.make("codex"),
-          method: "item/requestApproval/decision",
-          detail: "Unknown pending Codex approval request: approval-request-1",
+          provider: ProviderDriverKind.make("antigravity"),
+          method: "session/request_permission",
+          detail: "This approval request is no longer pending.",
         }),
       ),
     );
@@ -4125,6 +4125,10 @@ describe("ProviderCommandReactor", () => {
     const readModel = await harness.readModel();
     const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
     expect(thread).toBeDefined();
+    const shell = Option.getOrThrow(
+      await harness.runEffect(harness.snapshotQuery.getThreadShellById(ThreadId.make("thread-1"))),
+    );
+    expect(shell.hasPendingApprovals).toBe(false);
 
     const failureActivity = thread?.activities.find(
       (activity) => activity.kind === "provider.approval.respond.failed",
@@ -4145,15 +4149,16 @@ describe("ProviderCommandReactor", () => {
     expect(resolvedActivity).toBeUndefined();
   });
 
-  it("surfaces non-resumable provider user-input callbacks as stale failures", async () => {
+  it("closes stale Antigravity user input after the provider drops the question", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";
+    const responseAt = "2026-01-01T00:00:01.000Z";
     harness.respondToUserInput.mockImplementation(() =>
       Effect.fail(
         new ProviderAdapterRequestError({
-          provider: ProviderDriverKind.make("claudeAgent"),
-          method: "item/tool/respondToUserInput",
-          detail: "Unknown pending Codex user input request: user-input-request-1",
+          provider: ProviderDriverKind.make("antigravity"),
+          method: "session/request_permission",
+          detail: "This question is no longer pending.",
         }),
       ),
     );
@@ -4218,7 +4223,7 @@ describe("ProviderCommandReactor", () => {
         answers: {
           sandbox_mode: "workspace-write",
         },
-        createdAt: now,
+        createdAt: responseAt,
       }),
     );
 
@@ -4243,6 +4248,10 @@ describe("ProviderCommandReactor", () => {
       requestId: "user-input-request-1",
       detail: expect.stringContaining("Stale pending user-input request: user-input-request-1"),
     });
+    const shell = Option.getOrThrow(
+      await harness.runEffect(harness.snapshotQuery.getThreadShellById(ThreadId.make("thread-1"))),
+    );
+    expect(shell.hasPendingUserInput).toBe(false);
 
     const resolvedActivity = thread?.activities.find(
       (activity) =>
