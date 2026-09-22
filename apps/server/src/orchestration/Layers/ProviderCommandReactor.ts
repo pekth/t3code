@@ -146,40 +146,38 @@ function findProviderAdapterRequestError(
 function isUnknownPendingApprovalRequestError(cause: Cause.Cause<ProviderServiceError>): boolean {
   const error = findProviderAdapterRequestError(cause);
   if (error) {
-    const detail = error.detail.toLowerCase();
+    const detail = error.detail.trim().toLowerCase();
     return (
       detail.includes("unknown pending approval request") ||
       detail.includes("unknown pending permission request") ||
       detail.includes("unknown pending codex approval request") ||
-      detail.includes("this approval request is no longer pending")
+      detail === "this approval request is no longer pending."
     );
   }
   const message = Cause.pretty(cause).toLowerCase();
   return (
     message.includes("unknown pending approval request") ||
     message.includes("unknown pending permission request") ||
-    message.includes("unknown pending codex approval request") ||
-    message.includes("this approval request is no longer pending")
+    message.includes("unknown pending codex approval request")
   );
 }
 
 function isUnknownPendingUserInputRequestError(cause: Cause.Cause<ProviderServiceError>): boolean {
   const error = findProviderAdapterRequestError(cause);
   if (error) {
-    const detail = error.detail.toLowerCase();
+    const detail = error.detail.trim().toLowerCase();
     return (
       detail.includes("unknown pending user-input request") ||
       detail.includes("unknown pending user input request") ||
       detail.includes("unknown pending codex user input request") ||
-      detail.includes("this question is no longer pending")
+      detail === "this question is no longer pending."
     );
   }
   const message = Cause.pretty(cause).toLowerCase();
   return (
     message.includes("unknown pending user-input request") ||
     message.includes("unknown pending user input request") ||
-    message.includes("unknown pending codex user input request") ||
-    message.includes("this question is no longer pending")
+    message.includes("unknown pending codex user input request")
   );
 }
 
