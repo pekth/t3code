@@ -10,6 +10,7 @@ import {
 } from "./logicalProject";
 import {
   buildPhysicalToLogicalProjectKeyMap,
+  buildSidebarProjectDisplayNameMap,
   buildSidebarProjectPickerEntries,
   buildSidebarProjectSnapshots,
   projectGroupsSpanEnvironments,
@@ -52,6 +53,34 @@ function makeProject(overrides: Partial<Project> = {}): Project {
 }
 
 describe("environment grouping", () => {
+  it.each(["repository", "repository_path", "separate"] as const)(
+    "keeps labels for older project records in %s mode without mixing environments",
+    (sidebarProjectGroupingMode) => {
+      const older = makeProject();
+      const newer = makeProject({
+        id: ProjectId.make("project-newer"),
+        title: "Renamed project",
+        updatedAt: "2026-01-02T00:00:00.000Z",
+      });
+      const remote = makeProject({
+        environmentId: remoteEnvironmentId,
+        title: "Remote project",
+      });
+      const groups = buildSidebarProjectSnapshots({
+        projects: [older, newer, remote],
+        settings: { ...defaultGroupingSettings, sidebarProjectGroupingMode },
+        primaryEnvironmentId,
+        resolveEnvironmentLabel: () => null,
+      });
+      const labels = buildSidebarProjectDisplayNameMap(groups);
+
+      expect(groups).toHaveLength(2);
+      expect(labels.get(`${primaryEnvironmentId}:${older.id}`)).toBe("Renamed project");
+      expect(labels.get(`${primaryEnvironmentId}:${newer.id}`)).toBe("Renamed project");
+      expect(labels.get(`${remoteEnvironmentId}:${remote.id}`)).toBe("Remote project");
+    },
+  );
+
   it("groups matching repository identities across environments", () => {
     const primary = makeProject({ repositoryIdentity });
     const remote = makeProject({

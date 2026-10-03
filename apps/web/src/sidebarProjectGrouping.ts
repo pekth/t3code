@@ -26,6 +26,16 @@ export interface SidebarProjectSnapshot extends Project {
   remoteEnvironmentLabels: readonly string[];
 }
 
+export function buildSidebarProjectDisplayNameMap(groups: ReadonlyArray<SidebarProjectSnapshot>) {
+  return new Map(
+    groups.flatMap((group) =>
+      group.memberProjectRefs.map(
+        (project) => [`${project.environmentId}:${project.projectId}`, group.displayName] as const,
+      ),
+    ),
+  );
+}
+
 export function projectGroupsSpanEnvironments(
   groups: ReadonlyArray<Pick<SidebarProjectSnapshot, "memberProjects">>,
 ): boolean {
