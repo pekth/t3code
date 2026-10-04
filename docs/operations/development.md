@@ -111,6 +111,13 @@ Use `vp run lint:mobile` for native mobile changes. CI owns the full suite; see
 The [manual Windows lane](../../.github/workflows/windows-tests.yml) is available for focused
 Windows investigation while that suite is not a required gate.
 
+### Browser shortcut verification
+
+For macOS browser editing, compare physical shortcuts with the native Edit menu in the
+same field. The preview tests model Electron's delayed keyboard fallback; they do not
+verify native focus or clipboard dispatch. Check both manual and agent-opened panes on
+the affected website before claiming a runtime fix.
+
 ### Unused code
 
 `vp run knip:check` checks unused files and dependencies across the repo, then

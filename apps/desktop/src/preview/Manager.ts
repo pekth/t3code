@@ -2017,6 +2017,15 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     };
     const syncMenuShortcuts = (contents: Electron.WebContents, input: Electron.Input): void => {
       if (input.type !== "keyDown") return;
+      // macOS resolves unhandled editing keys after the renderer ACK. Input
+      // that cannot match a menu accelerator must not overwrite that gate.
+      if (
+        hostPlatform === "darwin" &&
+        (!(input.meta || input.control || input.alt) ||
+          ["Meta", "Control", "Alt", "Shift"].includes(input.key))
+      ) {
+        return;
+      }
       // Native editing roles must remain available after the page handles the key.
       // Background automation must not edit whichever other renderer has focus.
       contents.setIgnoreMenuShortcuts(

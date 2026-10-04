@@ -666,6 +666,76 @@ describe("PreviewManager", () => {
     ),
   );
 
+  effectIt.effect("preserves pending macOS editing fallback across non-accelerator input", () =>
+    withManager((manager) =>
+      Effect.gen(function* () {
+        const preview = makeFaviconWebContents();
+        fromId.mockReturnValue(preview.webContents);
+        yield* manager.createTab("tab_pending_edit");
+        yield* manager.registerWebview("tab_pending_edit", 42);
+        const popup = makeFaviconWebContents({ id: 43 });
+        preview.listeners.get("did-create-window")!({ webContents: popup.webContents } as never);
+
+        const input = (key: string, overrides: Partial<Electron.Input> = {}) =>
+          ({
+            type: "keyDown",
+            key,
+            meta: false,
+            control: false,
+            shift: false,
+            alt: false,
+            ...overrides,
+          }) as Electron.Input;
+        const followingInputs = [
+          input("Meta", { meta: true }),
+          input("Control", { control: true }),
+          input("Alt", { alt: true }),
+          input("Shift", { meta: true, shift: true }),
+          input("b"),
+          input("B", { shift: true }),
+          input("ArrowLeft"),
+          input("Tab"),
+          input("Meta", { type: "keyUp" }),
+        ];
+
+        for (const browser of [preview, popup]) {
+          let ignoreMenu = true;
+          const nativeEdits: Array<string> = [];
+          const contents = browser.webContents as Electron.WebContents;
+          vi.mocked(contents.setIgnoreMenuShortcuts).mockImplementation((ignore) => {
+            ignoreMenu = ignore;
+          });
+          getFocusedWebContents.mockReturnValue(browser.webContents as never);
+          const beforeInput = browser.listeners.get("before-input-event")!;
+          const preventDefault = vi.fn();
+
+          for (const key of ["a", "c", "v"]) {
+            for (const nextInput of followingInputs) {
+              // Electron v44.4.2 checks the current flag when the renderer ACK
+              // releases an unhandled key, rather than snapshotting it at dispatch.
+              const releaseAck = (handled = false) => {
+                if (!handled && !ignoreMenu) nativeEdits.push(key);
+              };
+              const editingInput = input(key, { meta: true });
+              beforeInput({ preventDefault } as never, editingInput as never);
+              releaseAck();
+              expect(nativeEdits.splice(0)).toEqual([key]);
+
+              beforeInput({ preventDefault } as never, editingInput as never);
+              beforeInput({ preventDefault } as never, nextInput as never);
+              releaseAck();
+              expect(nativeEdits.splice(0)).toEqual([key]);
+              beforeInput({ preventDefault } as never, editingInput as never);
+              releaseAck(true);
+              expect(nativeEdits).toEqual([]);
+            }
+          }
+          expect(preventDefault).not.toHaveBeenCalled();
+        }
+      }),
+    ),
+  );
+
   effectIt.effect("reports an unregistered webview as temporarily unavailable", () =>
     withManager((manager) =>
       Effect.gen(function* () {
