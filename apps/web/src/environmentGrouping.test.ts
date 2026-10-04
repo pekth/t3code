@@ -75,11 +75,36 @@ describe("environment grouping", () => {
       const labels = buildSidebarProjectDisplayNameMap(groups);
 
       expect(groups).toHaveLength(2);
-      expect(labels.get(`${primaryEnvironmentId}:${older.id}`)).toBe("Renamed project");
-      expect(labels.get(`${primaryEnvironmentId}:${newer.id}`)).toBe("Renamed project");
-      expect(labels.get(`${remoteEnvironmentId}:${remote.id}`)).toBe("Remote project");
+      expect(labels.get(JSON.stringify([primaryEnvironmentId, older.id]))).toBe("Renamed project");
+      expect(labels.get(JSON.stringify([primaryEnvironmentId, newer.id]))).toBe("Renamed project");
+      expect(labels.get(JSON.stringify([remoteEnvironmentId, remote.id]))).toBe("Remote project");
     },
   );
+
+  it("keeps separator-containing project references distinct after deduplication", () => {
+    const older = makeProject({ id: ProjectId.make("scope:project") });
+    const newer = makeProject({
+      id: ProjectId.make("project-newer"),
+      title: "Renamed project",
+      updatedAt: "2026-01-02T00:00:00.000Z",
+    });
+    const remote = makeProject({
+      environmentId: EnvironmentId.make(`${primaryEnvironmentId}:scope`),
+      id: ProjectId.make("project"),
+      title: "Remote project",
+    });
+    const groups = buildSidebarProjectSnapshots({
+      projects: [older, newer, remote],
+      settings: defaultGroupingSettings,
+      primaryEnvironmentId,
+      resolveEnvironmentLabel: () => null,
+    });
+
+    expect(groups.flatMap((group) => group.memberProjectRefs)).toHaveLength(3);
+    const labels = buildSidebarProjectDisplayNameMap(groups);
+    expect(labels.get(JSON.stringify([older.environmentId, older.id]))).toBe("Renamed project");
+    expect(labels.get(JSON.stringify([remote.environmentId, remote.id]))).toBe("Remote project");
+  });
 
   it("groups matching repository identities across environments", () => {
     const primary = makeProject({ repositoryIdentity });

@@ -1030,7 +1030,11 @@ const SidebarDraftBlock = memo(function SidebarDraftBlock(props: {
             draftId={draftId}
             composer={composer}
             project={props.projectByKey.get(projectKey) ?? null}
-            projectDisplayName={props.projectDisplayNameByKey.get(projectKey) ?? null}
+            projectDisplayName={
+              props.projectDisplayNameByKey.get(
+                JSON.stringify([session.environmentId, session.projectId]),
+              ) ?? null
+            }
             isActive={draftId === props.routeDraftId}
             onNavigate={props.onNavigateToDraft}
             onDiscard={handleDiscard}
@@ -4852,7 +4856,7 @@ export default function Sidebar() {
                         }
                         projectDisplayName={
                           projectDisplayNameByKey.get(
-                            `${thread.environmentId}:${thread.projectId}`,
+                            JSON.stringify([thread.environmentId, thread.projectId]),
                           ) ?? null
                         }
                         environmentLabel={environmentLabelById.get(thread.environmentId) ?? null}
@@ -5010,7 +5014,7 @@ export default function Sidebar() {
                             }
                             projectDisplayName={
                               projectDisplayNameByKey.get(
-                                `${thread.environmentId}:${thread.projectId}`,
+                                JSON.stringify([thread.environmentId, thread.projectId]),
                               ) ?? null
                             }
                             providerEntryByInstanceId={

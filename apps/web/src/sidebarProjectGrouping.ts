@@ -30,7 +30,8 @@ export function buildSidebarProjectDisplayNameMap(groups: ReadonlyArray<SidebarP
   return new Map(
     groups.flatMap((group) =>
       group.memberProjectRefs.map(
-        (project) => [`${project.environmentId}:${project.projectId}`, group.displayName] as const,
+        (project) =>
+          [JSON.stringify([project.environmentId, project.projectId]), group.displayName] as const,
       ),
     ),
   );

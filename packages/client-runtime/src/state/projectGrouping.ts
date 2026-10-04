@@ -287,7 +287,7 @@ export function buildProjectGroups<TProject extends EnvironmentProject>(input: {
     const logicalKey =
       logicalKeyByPhysicalKey.get(physicalProjectKey) ??
       deriveLogicalProjectKeyFromSettings(project, input.settings);
-    const projectRefKey = scopedProjectKey(scopeProjectRef(project.environmentId, project.id));
+    const projectRefKey = JSON.stringify([project.environmentId, project.id]);
     if (seenProjectRefs.has(projectRefKey)) continue;
     seenProjectRefs.add(projectRefKey);
     const projectRef = scopeProjectRef(project.environmentId, project.id);

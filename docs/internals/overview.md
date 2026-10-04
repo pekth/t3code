@@ -16,7 +16,9 @@ web and mobile. See [connection runtime](./connection-runtime.md) and
 Project groups deduplicate registrations at the same environment and workspace path.
 Threads can still reference an older registration. Resolve their group labels through
 `memberProjectRefs`, which preserves every project ID, rather than the deduplicated display
-members. See [sidebar project grouping](../../apps/web/src/sidebarProjectGrouping.ts).
+members. Reference deduplication and this label lookup use serialized ID pairs so
+separator characters in IDs cannot merge references. See
+[sidebar project grouping](../../apps/web/src/sidebarProjectGrouping.ts).
 
 The [RPC contract](../../packages/contracts/src/rpc.ts) is the boundary between independently
 versioned clients and servers. Subscriptions send the state a client needs, so a client viewing one
