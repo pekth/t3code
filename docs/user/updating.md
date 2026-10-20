@@ -53,8 +53,9 @@ A thread that finished its turn to wait on a monitor, subagent, or background ta
 is woken and told that this work stopped. A background shell, such as a dev server,
 does not wake it; the thread learns about it with your next message.
 A thread is not resumed while it waits for your approval, answer, or secret, or
-while it is archived, snoozed, or settled. After three automatic resumes in a row,
-the thread waits for your next message.
+while it is archived, snoozed, or settled. A stopped turn is never resumed. Each
+interrupted turn gets one automatic continuation. If that continuation is interrupted
+by another restart, the thread waits for your next message.
 
 Updates from the previous orchestration system preserve conversation transcripts but cannot carry
 every kind of runtime history forward. Read [Threads from older T3 Code versions](./thread-migration.md)

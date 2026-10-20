@@ -352,6 +352,24 @@ export const make = Effect.gen(function* () {
           },
         });
       }
+      const interruptRequests =
+        runs.length === 0
+          ? []
+          : (yield* projections
+              .getThreadRecords(projection.thread.id, ["turnItems"], {
+                turnItemRunIds: runs.map((run) => run.id),
+                turnItemTypes: ["run_interrupt_request"],
+              })
+              .pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderRuntimeRecoveryError({
+                      operation: "read-projections",
+                      threadId: projection.thread.id,
+                      cause,
+                    }),
+                ),
+              )).turnItems;
       for (const run of runs) {
         events.push({
           id: yield* allocateEventId(),
@@ -360,7 +378,15 @@ export const make = Effect.gen(function* () {
           runId: run.id,
           providerInstanceId: run.providerInstanceId,
           occurredAt: now,
-          payload: { ...run, status: "cancelled", queuePosition: null, completedAt: now },
+          payload: {
+            ...run,
+            status: "cancelled",
+            queuePosition: null,
+            completedAt: now,
+            terminalReason: interruptRequests.some((item) => item.runId === run.id)
+              ? "user_stop"
+              : "server_restart",
+          },
         });
         for (const attempt of projection.attempts.filter(
           (candidate) =>
@@ -628,16 +654,17 @@ export const make = Effect.gen(function* () {
               now,
             )
           : undefined;
-      const effects: Array<EffectOutbox.PendingOrchestrationEffectV2> = continuationRun
-        ? [
-            {
-              id: `effect:restart-continuation:${continuationRun.id}`,
-              commandId,
-              threadId: projection.thread.id,
-              request: { type: "provider-runtime.continue", sourceRunId: continuationRun.id },
-            },
-          ]
-        : [];
+      const effects: Array<EffectOutbox.PendingOrchestrationEffectV2> =
+        continuationRun && !interruptRequests.some((item) => item.runId === continuationRun.id)
+          ? [
+              {
+                id: `effect:restart-continuation:${continuationRun.id}`,
+                commandId,
+                threadId: projection.thread.id,
+                request: { type: "provider-runtime.continue", sourceRunId: continuationRun.id },
+              },
+            ]
+          : [];
       const stoppedSessions = projection.providerSessions.filter(
         (candidate) => candidate.status !== "stopped" && candidate.status !== "error",
       ).length;

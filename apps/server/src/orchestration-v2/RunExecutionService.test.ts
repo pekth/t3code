@@ -3874,11 +3874,19 @@ it.effect.each(["completed", "interrupted", "cancelled", "failed"] as const)(
   "refreshes pull requests after the current root run %s",
   (status) =>
     Effect.gen(function* () {
-      const { observed } = yield* captureRootRunTermination({
+      const { observed, finalEvents } = yield* captureRootRunTermination({
         key: `pull-request-refresh:${status}`,
         shouldFinalizeRun: () => Effect.succeed(true),
         events: (ids) => Stream.make(rootTerminalEvent(ids, status)),
       });
+      assert.equal(
+        finalEvents.find((event) => event.type === "run.updated")?.payload.terminalReason,
+        status === "completed"
+          ? undefined
+          : status === "failed"
+            ? "provider_failure"
+            : `provider_${status}`,
+      );
       assert.deepEqual(observed, [
         `run:${status === "completed" ? "waiting" : status}`,
         "pull-requests-refreshed",
@@ -3956,6 +3964,10 @@ it.effect("fails the run when its event stream ends without a root terminal", ()
       shouldFinalizeRun: () => Effect.succeed(true),
       events: () => Stream.empty,
     });
+    assert.equal(
+      finalEvents.find((event) => event.type === "run.updated")?.payload.terminalReason,
+      "provider_stream_failed",
+    );
     assert.deepEqual(observed, ["run:failed", "pull-requests-refreshed"]);
     assert.equal(
       finalEvents.find((event) => event.type === "provider-thread.updated")?.payload.status,
@@ -4001,12 +4013,13 @@ it.effect("does not start a turn whose run settled during the app context read",
   }),
 );
 
-it.effect("refreshes pull requests only once when startup failure closes its event stream", () =>
+it.effect.each([false, true])("records startup failure once, with Stop precedence=%s", (stopped) =>
   Effect.gen(function* () {
     const ingestionStarted = yield* Deferred.make<void>();
-    const { observed, written } = yield* captureRootRunTermination({
+    const { observed, written, finalEvents } = yield* captureRootRunTermination({
       key: "pull-request-refresh:startup-error",
       shouldFinalizeRun: () => Effect.succeed(true),
+      hasUnpairedRunInterruptRequest: () => Effect.succeed(stopped),
       events: () =>
         Stream.unwrap(Deferred.succeed(ingestionStarted, undefined).pipe(Effect.as(Stream.never))),
       startTurn: (input) =>
@@ -4024,6 +4037,10 @@ it.effect("refreshes pull requests only once when startup failure closes its eve
           ),
         ),
     });
+    assert.equal(
+      finalEvents.find((event) => event.type === "run.updated")?.payload.terminalReason,
+      stopped ? "user_stop" : "start_failed",
+    );
     assert.equal(observed.filter((item) => item === "pull-requests-refreshed").length, 1);
     assert.equal(observed[0], "run:failed");
     const error = written.find((item) => item.type === "error");
@@ -4775,5 +4792,35 @@ it.effect("releases ingestion after idle subagent rows and items settle", () =>
       "turn_item:idle",
       "root-finalized",
     ]);
+  }),
+);
+
+it.effect("records user Stop instead of provider interruption", () =>
+  Effect.gen(function* () {
+    const { finalEvents } = yield* captureRootRunTermination({
+      key: "terminal-reason:user-stop",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      hasUnpairedRunInterruptRequest: () => Effect.succeed(true),
+      events: (ids) => Stream.make(rootTerminalEvent(ids, "interrupted")),
+    });
+    assert.equal(
+      finalEvents.find((event) => event.type === "run.updated")?.payload.terminalReason,
+      "user_stop",
+    );
+  }),
+);
+
+it.effect("leaves interrupted provider startup to restart recovery", () =>
+  Effect.gen(function* () {
+    const ingestionStarted = yield* Deferred.make<void>();
+    const result = yield* captureRootRunTermination({
+      key: "start-turn:shutdown",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: () =>
+        Stream.unwrap(Deferred.succeed(ingestionStarted, undefined).pipe(Effect.as(Stream.never))),
+      startTurn: () => Deferred.await(ingestionStarted).pipe(Effect.andThen(Effect.interrupt)),
+    }).pipe(Effect.exit);
+    assert.isTrue(Exit.isFailure(result));
+    if (Exit.isFailure(result)) assert.isTrue(Cause.hasInterruptsOnly(result.cause));
   }),
 );

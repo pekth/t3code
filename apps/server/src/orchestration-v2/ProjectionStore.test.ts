@@ -1188,6 +1188,38 @@ it.effect("memory shell snapshots scope to one project", () =>
 );
 
 it.layer(layerTest)("ProjectionStoreV2", (it) => {
+  it.effect("persists terminal reasons in SQL and recovery reads while accepting legacy runs", () =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = yield* addRolledBackRecoveryCandidate("terminal-reasons");
+      const run = (yield* store.getThreadProjection(threadId)).runs[0]!;
+      assert.isUndefined(run.terminalReason);
+      const now = yield* DateTime.now;
+      yield* store.apply({
+        id: EventId.make("event:terminal-reasons:cancelled"),
+        type: "run.updated",
+        threadId,
+        runId: run.id,
+        providerInstanceId,
+        occurredAt: now,
+        payload: {
+          ...run,
+          status: "cancelled",
+          terminalReason: "server_restart",
+          completedAt: now,
+        },
+      });
+      assert.equal(
+        (yield* store.getThreadProjection(threadId)).runs[0]?.terminalReason,
+        "server_restart",
+      );
+      assert.equal(
+        (yield* store.getRuntimeRecoveryProjection(threadId)).runs[0]?.terminalReason,
+        "server_restart",
+      );
+    }),
+  );
+
   it.effect("returns a typed read error for malformed stored plan JSON", () =>
     Effect.gen(function* () {
       const store = yield* ProjectionStore.ProjectionStoreV2;

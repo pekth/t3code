@@ -620,6 +620,7 @@ export const layer: Layer.Layer<
         readonly hasUnpairedRunInterruptRequest?: () => Effect.Effect<boolean, never>;
         readonly openRunOwnedSubagents?: OpenRunOwnedSubagentProjection;
         readonly terminal: ProviderTerminalEvent;
+        readonly terminalReason?: OrchestrationV2Run["terminalReason"];
         readonly failureItemPersisted: boolean;
         readonly refreshAfterTurn: Effect.Effect<void>;
         readonly writeIfRunCurrent?: {
@@ -694,9 +695,24 @@ export const layer: Layer.Layer<
         // over a newer acknowledgement, successor, or Stop barrier.
         const { delegatedCompletion: _delegatedCompletion, ...runWithoutDelegatedCompletion } =
           input.run;
+        const userStopped =
+          input.hasUnpairedRunInterruptRequest === undefined
+            ? false
+            : yield* input.hasUnpairedRunInterruptRequest();
         const finalizedRun: OrchestrationV2Run = {
           ...runWithoutDelegatedCompletion,
           status: persistedStatus,
+          terminalReason:
+            input.terminal.status === "completed"
+              ? undefined
+              : userStopped
+                ? "user_stop"
+                : (input.terminalReason ??
+                  (input.terminal.status === "failed"
+                    ? "provider_failure"
+                    : input.terminal.status === "interrupted"
+                      ? "provider_interrupted"
+                      : "provider_cancelled")),
           completedAt: input.terminal.status === "completed" ? null : completedAt,
         };
         const finalizedRootNode: OrchestrationV2ExecutionNode = {
@@ -933,6 +949,12 @@ export const layer: Layer.Layer<
                   }),
                   input.providerTurnOrdinal * 100 + 1,
                 ),
+                terminalReason: "start_failed",
+                ...(input.hasUnpairedRunInterruptRequest === undefined
+                  ? {}
+                  : {
+                      hasUnpairedRunInterruptRequest: input.hasUnpairedRunInterruptRequest,
+                    }),
                 failureItemPersisted: false,
                 refreshAfterTurn,
                 writeIfRunCurrent: {
@@ -1457,6 +1479,13 @@ export const layer: Layer.Layer<
                                           }),
                                           latestItemOrdinal + 1,
                                         ),
+                                        terminalReason: "provider_stream_failed",
+                                        ...(input.hasUnpairedRunInterruptRequest === undefined
+                                          ? {}
+                                          : {
+                                              hasUnpairedRunInterruptRequest:
+                                                input.hasUnpairedRunInterruptRequest,
+                                            }),
                                         failureItemPersisted: false,
                                         refreshAfterTurn,
                                       }),
@@ -1550,53 +1579,63 @@ export const layer: Layer.Layer<
             ))
           : input.session.startTurn(turnInput);
         yield* Effect.andThen(shouldStart, startTurn).pipe(
+          // Shutdown owns recovery; an interrupted start is not a failed turn.
           Effect.catchCause((cause) =>
-            Effect.logError("orchestration V2 provider turn start failed", {
-              runId: input.run.id,
-              cause,
-            }).pipe(
-              Effect.andThen(Fiber.interrupt(providerEventFiber)),
-              Effect.andThen(Ref.get(latestProviderThread)),
-              Effect.flatMap((providerThread) =>
-                Ref.get(latestTurnItemOrdinal).pipe(
-                  Effect.flatMap((latestItemOrdinal) =>
-                    Ref.get(openRunOwnedSubagents).pipe(
-                      Effect.flatMap((openSubagents) =>
-                        writeFinalRunEvents({
-                          run: input.run,
-                          rootNode: input.rootNode,
-                          checkpointScope: input.checkpointScope,
-                          providerThread,
-                          attempt: input.attempt,
-                          writeIfRunCurrent: {
-                            activeAttemptId: input.attempt.id,
-                            expectedStatus: "running",
-                          },
-                          openRunOwnedSubagents: openSubagents,
-                          terminal: makeFailedTerminalEvent(
-                            makeProviderFailure({
-                              cause: Cause.squash(cause),
-                              class: Exit.isFailure(shouldStart) ? "unknown" : "provider_error",
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.interrupt
+              : Effect.logError("orchestration V2 provider turn start failed", {
+                  runId: input.run.id,
+                  cause,
+                }).pipe(
+                  Effect.andThen(Fiber.interrupt(providerEventFiber)),
+                  Effect.andThen(Ref.get(latestProviderThread)),
+                  Effect.flatMap((providerThread) =>
+                    Ref.get(latestTurnItemOrdinal).pipe(
+                      Effect.flatMap((latestItemOrdinal) =>
+                        Ref.get(openRunOwnedSubagents).pipe(
+                          Effect.flatMap((openSubagents) =>
+                            writeFinalRunEvents({
+                              run: input.run,
+                              rootNode: input.rootNode,
+                              checkpointScope: input.checkpointScope,
+                              providerThread,
+                              attempt: input.attempt,
+                              writeIfRunCurrent: {
+                                activeAttemptId: input.attempt.id,
+                                expectedStatus: "running",
+                              },
+                              openRunOwnedSubagents: openSubagents,
+                              terminal: makeFailedTerminalEvent(
+                                makeProviderFailure({
+                                  cause: Cause.squash(cause),
+                                  class: Exit.isFailure(shouldStart) ? "unknown" : "provider_error",
+                                }),
+                                latestItemOrdinal + 1,
+                              ),
+                              terminalReason: "start_failed",
+                              ...(input.hasUnpairedRunInterruptRequest === undefined
+                                ? {}
+                                : {
+                                    hasUnpairedRunInterruptRequest:
+                                      input.hasUnpairedRunInterruptRequest,
+                                  }),
+                              failureItemPersisted: false,
+                              refreshAfterTurn,
                             }),
-                            latestItemOrdinal + 1,
                           ),
-                          failureItemPersisted: false,
-                          refreshAfterTurn,
-                        }),
+                        ),
                       ),
                     ),
                   ),
+                  Effect.mapError(
+                    (writeCause) =>
+                      new RunExecutionStartError({
+                        commandId: input.commandId,
+                        runId: input.run.id,
+                        cause: { start: cause, write: writeCause },
+                      }),
+                  ),
                 ),
-              ),
-              Effect.mapError(
-                (writeCause) =>
-                  new RunExecutionStartError({
-                    commandId: input.commandId,
-                    runId: input.run.id,
-                    cause: { start: cause, write: writeCause },
-                  }),
-              ),
-            ),
           ),
         );
       }),

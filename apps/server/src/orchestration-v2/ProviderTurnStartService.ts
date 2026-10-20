@@ -326,7 +326,16 @@ export const layer: Layer.Layer<
           };
           const eventPayloads = [
             { type: "turn-item.updated", payload: item },
-            { type: "run.updated", payload: { ...run, status, ...started, completedAt: now } },
+            {
+              type: "run.updated",
+              payload: {
+                ...run,
+                status,
+                terminalReason: status === "failed" ? "start_failed" : undefined,
+                ...started,
+                completedAt: now,
+              },
+            },
             {
               type: "run-attempt.updated",
               payload: { ...attempt, status, ...started, completedAt: now },

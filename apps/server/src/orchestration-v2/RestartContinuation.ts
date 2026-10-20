@@ -30,9 +30,6 @@ import {
 
 const CONTINUE_PROMPT = "Continue where you left off.";
 
-const MAX_CONTINUATION_CHAIN = 3;
-const CONTINUATION_LOOP_WINDOW_MS = 5 * 60 * 1_000;
-
 function restartContinuationBlocked(
   projection: Pick<
     ProjectionRuntimeRecoveryState,
@@ -136,13 +133,11 @@ export function restartContinuationRun(
         : latest,
     undefined,
   );
-  if (!run) return;
-  const preparedContinuation =
-    run.status === "starting" && run.restartContinuationOfRunId !== undefined;
+  if (!run || run.restartContinuationOfRunId !== undefined) return;
   const settled = run.status === "completed" || run.status === "waiting";
-  if (run.status !== "running" && !preparedContinuation && !settled) return;
+  if (run.status !== "running" && !settled) return;
   if (restartContinuationBlocked(projection, run, now, settled)) return;
-  const liveTurnRequired = !preparedContinuation && !settled;
+  const liveTurnRequired = !settled;
   if (projection.thread.providerInstanceId !== run.providerInstanceId) return;
   const providerThread = projection.providerThreads.find(
     (thread) => thread.id === run.providerThreadId,
@@ -169,7 +164,8 @@ export function restartContinuationRun(
     session === undefined ||
     session.providerInstanceId !== run.providerInstanceId ||
     session.driver !== providerThread.driver ||
-    (!preparedContinuation && (session.status === "stopped" || session.status === "error"))
+    session.status === "stopped" ||
+    session.status === "error"
   )
     return;
   if (settled) return hasOpenAwaitedWork(projection, providerThread) ? run : undefined;
@@ -227,26 +223,8 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
     )
       return;
     if (projection.thread.providerInstanceId !== source.providerInstanceId) return;
-    // A turn that keeps crashing the server would otherwise restart it forever.
-    let chainLength = 0;
-    const loopWindowStart =
-      DateTime.toEpochMillis(source.completedAt ?? source.requestedAt) -
-      CONTINUATION_LOOP_WINDOW_MS;
-    for (
-      let run: OrchestrationV2Run | undefined = source;
-      run?.restartContinuationOfRunId !== undefined && chainLength < MAX_CONTINUATION_CHAIN;
-      run = projection.runs.find((candidate) => candidate.id === run?.restartContinuationOfRunId)
-    ) {
-      if (DateTime.toEpochMillis(run.requestedAt) < loopWindowStart) break;
-      chainLength += 1;
-    }
-    if (chainLength >= MAX_CONTINUATION_CHAIN) {
-      yield* Effect.logWarning("Not continuing a run restarted too many times in a row", {
-        threadId: input.threadId,
-        sourceRunId: input.sourceRunId,
-      });
-      return;
-    }
+    // Never turn a repeatedly interrupted continuation into an automatic resume loop.
+    if (source.restartContinuationOfRunId !== undefined) return;
     const sourceRecords = yield* threads.getThreadRecords(
       input.threadId,
       ["messages", "turnItems"],

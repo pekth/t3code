@@ -542,6 +542,23 @@ export const OrchestrationV2Run = Schema.Struct({
   rootNodeId: Schema.NullOr(NodeId),
   activeAttemptId: Schema.NullOr(RunAttemptId),
   status: OrchestrationV2RunStatus,
+  // Optional for events written before terminal reasons were recorded.
+  terminalReason: Schema.optional(
+    Schema.Literals([
+      "user_stop",
+      "superseded_by_user_message",
+      "server_restart",
+      "provider_stream_failed",
+      "provider_failure",
+      "provider_interrupted",
+      "provider_cancelled",
+      "start_failed",
+      "workspace_preparation_failed",
+      "thread_archived",
+      "thread_deleted",
+      "delivery_disposed",
+    ]),
+  ),
   queuePosition: Schema.optional(Schema.NullOr(PositiveInt)),
   queueHeld: Schema.optional(Schema.Boolean),
   requestedAt: Schema.DateTimeUtc,

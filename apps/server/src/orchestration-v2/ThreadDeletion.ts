@@ -77,7 +77,13 @@ export const planThreadDeletion = Effect.fn("ThreadDeletion.planThreadDeletion")
       runId: run.id,
       providerInstanceId: run.providerInstanceId,
       occurredAt: now,
-      payload: { ...run, status: "cancelled", queuePosition: null, completedAt: now },
+      payload: {
+        ...run,
+        status: "cancelled",
+        terminalReason: "thread_deleted",
+        queuePosition: null,
+        completedAt: now,
+      },
     });
   }
   for (const attempt of projection.attempts) {

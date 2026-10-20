@@ -1162,6 +1162,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         payload: {
           ...input.run,
           status: "cancelled",
+          terminalReason: "delivery_disposed",
           queuePosition: null,
           completedAt: input.now,
         },
@@ -1301,7 +1302,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(rootNode === undefined ? {} : { nodeId: rootNode.id }),
         providerInstanceId: queuedRun.providerInstanceId,
         occurredAt: now,
-        payload: { ...queuedRun, status: "failed", queuePosition: null, completedAt: now },
+        payload: {
+          ...queuedRun,
+          status: "failed",
+          terminalReason: "start_failed",
+          queuePosition: null,
+          completedAt: now,
+        },
       },
     ]);
   });
@@ -3433,7 +3440,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           runId: run.id,
           providerInstanceId: run.providerInstanceId,
           occurredAt: now,
-          payload: { ...run, status: "cancelled", queuePosition: null, completedAt: now },
+          payload: {
+            ...run,
+            status: "cancelled",
+            terminalReason: "thread_archived",
+            queuePosition: null,
+            completedAt: now,
+          },
         });
       }
       for (const run of preparingRuns) {
@@ -7837,6 +7850,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       payload: {
         ...queuedRun,
         status: "cancelled",
+        terminalReason: "superseded_by_user_message",
         queuePosition: null,
         completedAt: now,
       },
@@ -8032,6 +8046,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       payload: {
         ...queuedRun,
         status: "cancelled",
+        terminalReason: "user_stop",
         queuePosition: null,
         completedAt: now,
       },
@@ -8431,7 +8446,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       nodeId: state.rootNode.id,
       providerInstanceId: state.run.providerInstanceId,
       occurredAt: now,
-      payload: { ...state.run, status: "failed", completedAt: now },
+      payload: {
+        ...state.run,
+        status: "failed",
+        terminalReason: "workspace_preparation_failed",
+        completedAt: now,
+      },
     });
   });
 
@@ -8509,7 +8529,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     yield* emitEvent({
       ...scope,
       type: "run.updated",
-      payload: { ...state.run, status: "preparing", completedAt: null },
+      payload: { ...state.run, status: "preparing", terminalReason: undefined, completedAt: null },
     });
     // Messages held when this preparation failed follow the run again. A hold
     // from a later run (a stop, say) is not this failure's to release.
@@ -8874,6 +8894,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       payload: {
         ...runWithoutDelegatedCompletion,
         status: "interrupted",
+        terminalReason: "user_stop",
         completedAt: input.now,
       },
     });
@@ -9566,7 +9587,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         nodeId: rootNode.id,
         providerInstanceId: run.providerInstanceId,
         occurredAt: now,
-        payload: { ...run, status: "interrupted", completedAt: now },
+        payload: { ...run, status: "interrupted", terminalReason: "user_stop", completedAt: now },
       });
       yield* stopRemainingWork();
       yield* Ref.update(effects, (existing) => [...existing, ...otherProviderInterrupts]);

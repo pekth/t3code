@@ -141,7 +141,10 @@ type ProviderTurnState = Pick<
 >;
 
 export function isRestartNoteSource(
-  source: Pick<OrchestrationV2Run, "status" | "activeAttemptId" | "restartCancelledBackgroundWork">,
+  source: Pick<
+    OrchestrationV2Run,
+    "status" | "activeAttemptId" | "restartCancelledBackgroundWork" | "terminalReason"
+  >,
   providerTurns: ReadonlyArray<Pick<ProviderTurnState, "runAttemptId" | "status">>,
 ): boolean {
   return (
@@ -196,9 +199,14 @@ export function cancelledBeforeStart(
 }
 
 export function isRestartContinuationSource(
-  source: Pick<OrchestrationV2Run, "status" | "activeAttemptId" | "restartCancelledBackgroundWork">,
+  source: Pick<
+    OrchestrationV2Run,
+    "status" | "activeAttemptId" | "restartCancelledBackgroundWork" | "terminalReason"
+  >,
   providerTurns: ReadonlyArray<Pick<ProviderTurnState, "runAttemptId" | "status">>,
 ): boolean {
+  if (source.terminalReason !== undefined && source.terminalReason !== "server_restart")
+    return false;
   return isRestartNoteSource(source, providerTurns)
     ? (source.restartCancelledBackgroundWork ?? []).some(isAwaitedWork)
     : source.status === "cancelled";
