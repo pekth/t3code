@@ -4403,6 +4403,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     SELECT 1 FROM orchestration_v2_projection_subagents AS subagent
                     WHERE subagent.provider_thread_id = provider_thread.provider_thread_id
                       AND subagent.thread_id = ${threadId}
+                      -- App-owned child threads reconcile their own provider state.
+                      AND subagent.origin = 'provider_native'
                   )
                 )
                 AND (

@@ -12,6 +12,8 @@ import {
   ProviderInstanceId,
   ProviderSessionId,
   ProviderThreadId,
+  ProviderTurnId,
+  RunAttemptId,
   RunId,
   RuntimeRequestId,
   ThreadId,
@@ -632,7 +634,7 @@ it.effect("includes shared sessions and provider-owned background rosters in rec
         pendingBackgroundTasks: [],
       },
     });
-    const preparedRunId = yield* createRun(prepared, "starting", {
+    yield* createRun(prepared, "starting", {
       providerThreadId: preparedProviderThreadId,
       restartContinuationOfRunId: RunId.make("run:recovery:source"),
     });
@@ -645,7 +647,7 @@ it.effect("includes shared sessions and provider-owned background rosters in rec
       preparedState.providerSessions.map((session) => session.id),
       [preparedSessionId],
     );
-    assert.equal(restartContinuationRun(preparedState, yield* DateTime.now)?.id, preparedRunId);
+    assert.isUndefined(restartContinuationRun(preparedState, yield* DateTime.now));
     assert.deepEqual(yield* projections.getUnreadableThreadIds(), []);
     const sql = yield* SqlClient.SqlClient;
     yield* sql`
@@ -936,6 +938,171 @@ it.effect("wakes a settled run whose native subagent ran on its own provider thr
       },
     ]);
   }).pipe(Effect.provide(layerRecoveryTest)),
+);
+
+it.effect.each([
+  { kind: "initial delegation", ordinal: 1, delegated: true },
+  { kind: "thread-send follow-up", ordinal: 3, delegated: true },
+  { kind: "ordinary user follow-up", ordinal: 3, delegated: false },
+])(
+  "recovers $kind after its parent without losing continuation eligibility",
+  ({ ordinal, delegated }) =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
+      const now = yield* DateTime.now;
+      const parent = yield* createThread("a-parent");
+      const threadId = yield* createThread("z-follow-up");
+      const parentRun = yield* createRun(parent, "completed");
+      const providerSessionId = ProviderSessionId.make("session:follow-up");
+      const providerThreadId = ProviderThreadId.make("provider-thread:follow-up");
+      const attemptId = RunAttemptId.make("attempt:follow-up");
+      const turnId = ProviderTurnId.make("turn:follow-up");
+      const rootNodeId = NodeId.make("node:follow-up");
+      const taskId = NodeId.make("task:follow-up");
+      for (const boundThreadId of [parent, threadId]) {
+        yield* projections.apply({
+          id: EventId.make(`event:${boundThreadId}:session`),
+          type: "provider-session.attached",
+          threadId: boundThreadId,
+          driver,
+          providerInstanceId,
+          occurredAt: now,
+          payload: {
+            id: providerSessionId,
+            driver,
+            providerInstanceId,
+            status: "ready",
+            cwd: "/workspace",
+            model: modelSelection.model,
+            capabilities: CodexProviderCapabilitiesV2,
+            createdAt: now,
+            updatedAt: now,
+            lastError: null,
+          },
+        });
+      }
+      for (let previous = 1; previous < ordinal; previous++) {
+        yield* createRun(threadId, "completed", { ordinal: previous, providerThreadId });
+      }
+      const runId = yield* createRun(threadId, "running", {
+        ordinal,
+        providerThreadId,
+        activeAttemptId: attemptId,
+        rootNodeId,
+        ...(delegated && ordinal > 1 ? { delegatedTaskId: taskId } : {}),
+      });
+      yield* projections.apply({
+        id: EventId.make("event:follow-up:provider-thread"),
+        type: "provider-thread.updated",
+        threadId,
+        driver,
+        providerInstanceId,
+        occurredAt: now,
+        payload: {
+          id: providerThreadId,
+          appThreadId: threadId,
+          ownerNodeId: null,
+          driver,
+          providerInstanceId,
+          providerSessionId,
+          nativeThreadRef: { driver, nativeId: "native:follow-up", strength: "strong" },
+          nativeConversationHeadRef: null,
+          status: "active",
+          firstRunOrdinal: 1,
+          lastRunOrdinal: ordinal,
+          handoffIds: [],
+          forkedFrom: null,
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+      yield* projections.apply({
+        id: EventId.make("event:follow-up:attempt"),
+        type: "run-attempt.created",
+        threadId,
+        runId,
+        occurredAt: now,
+        payload: {
+          id: attemptId,
+          runId,
+          attemptOrdinal: 1,
+          rootNodeId,
+          providerInstanceId,
+          providerThreadId,
+          providerTurnId: turnId,
+          reason: "initial",
+          status: "running",
+          startedAt: now,
+          completedAt: null,
+        },
+      });
+      yield* projections.apply({
+        id: EventId.make("event:follow-up:turn"),
+        type: "provider-turn.updated",
+        threadId,
+        runId,
+        occurredAt: now,
+        payload: {
+          id: turnId,
+          providerThreadId,
+          nodeId: rootNodeId,
+          runAttemptId: attemptId,
+          nativeTurnRef: { driver, nativeId: "native:turn", strength: "strong" },
+          ordinal,
+          status: "running",
+          startedAt: now,
+          completedAt: null,
+        },
+      });
+      if (delegated) {
+        // A finished delegation retains the child's provider thread when a later turn reuses it.
+        yield* projections.apply({
+          id: EventId.make("event:follow-up:delegation"),
+          type: "subagent.updated",
+          threadId: parent,
+          occurredAt: now,
+          payload: {
+            id: taskId,
+            threadId: parent,
+            runId: parentRun,
+            parentNodeId: NodeId.make("node:parent"),
+            origin: "app_owned",
+            createdBy: "agent",
+            driver,
+            providerInstanceId,
+            providerThreadId,
+            childThreadId: threadId,
+            nativeTaskRef: null,
+            prompt: "Complete the task",
+            title: null,
+            model: null,
+            status: ordinal === 1 ? "running" : "completed",
+            result: null,
+            startedAt: now,
+            completedAt: ordinal === 1 ? null : now,
+            updatedAt: now,
+          },
+        });
+      }
+      const recoveryOrder = yield* projections.getRecoveryThreadIds("runtime");
+      assert.isBelow(recoveryOrder.indexOf(parent), recoveryOrder.indexOf(threadId));
+      yield* recovery.reconcile("startup");
+      const effectId = `effect:restart-continuation:${runId}`;
+      const sql = yield* SqlClient.SqlClient;
+      const queued = yield* sql<{ readonly effect_id: string }>`
+      SELECT effect_id FROM orchestration_v2_effect_outbox WHERE thread_id = ${threadId}
+    `;
+      assert.deepEqual(queued, [{ effect_id: effectId }]);
+      const recovered = yield* projections.getThreadProjection(threadId);
+      assert.equal(recovered.runs.at(-1)?.terminalReason, "server_restart");
+      // Replaying startup must leave the same durable attempt, not create a second one.
+      yield* recovery.reconcile("startup");
+      const effects = yield* sql<{ readonly effect_id: string }>`
+      SELECT effect_id FROM orchestration_v2_effect_outbox WHERE thread_id = ${threadId}
+    `;
+      assert.deepEqual(effects, [{ effect_id: effectId }]);
+    }).pipe(Effect.provide(layerRecoveryTest)),
 );
 
 it.effect("marks fork descendants unreadable when their source is missing or corrupt", () =>
